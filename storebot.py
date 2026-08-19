@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""storebot — Telegram bot reporting Midgar's App Store sales and RevenueCat revenue.
+"""storebot — Telegram bot pinging Midgar's App Store + RevenueCat revenue.
 
-Long-polls a dedicated Telegram bot. Answers on-demand commands and sends a
-scheduled daily digest (default 09:00 local):
+Long-polls a dedicated Telegram bot. Core feature: a revenue watcher that polls
+RevenueCat's realtime revenue metric (default every 60s) and pings the moment a
+project earns money — or logs a refund:
+
+  💰 Solar Beam +$6.00 (today $6.00)
+  ⚠️ Refund — Solar Beam -$6.00 (today $0.00)
+
+Plus on-demand commands and one lean daily digest (default 09:00 local):
 
   /sales [n|week|month|date]   App Store downloads + proceeds (default: yesterday)
   /countries [date]            top download countries for a single day
@@ -11,7 +17,7 @@ scheduled daily digest (default 09:00 local):
   /apps                        one-line snapshot per tracked app
   /digest                      send the daily digest now
   /status                      health, uptime, next digest
-  /on  /off                    toggle the daily digest
+  /on  /off                    toggle alerts (revenue pings + daily digest)
 
 Data sources: App Store Connect salesReports (SALES/SUMMARY per day, gzip TSV,
 ES256 JWT signed locally) and the RevenueCat v2 API. Every RC_SECRET_* key in
@@ -23,6 +29,7 @@ Config (both files parsed by the bot itself; sourceable `export KEY=value` and
 plain KEY=value lines accepted):
   ~/.config/storebot/secrets.env   STOREBOT_TOKEN, STOREBOT_CHAT_IDS,
                                    STOREBOT_DIGEST_HOUR (default 9),
+                                   STOREBOT_POLL_SECONDS (default 60),
                                    STOREBOT_VENDOR (ASC vendor number),
                                    STOREBOT_API_BASE (default https://api.telegram.org)
   ~/.config/midgar/credentials.env ASC_KEY_ID, ASC_ISSUER_ID,
@@ -48,7 +55,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -115,6 +122,10 @@ def load_config():
         cfg["STOREBOT_DIGEST_HOUR"] = int(cfg.get("STOREBOT_DIGEST_HOUR", "9"))
     except ValueError:
         cfg["STOREBOT_DIGEST_HOUR"] = 9
+    try:
+        cfg["STOREBOT_POLL_SECONDS"] = int(cfg.get("STOREBOT_POLL_SECONDS", "60"))
+    except ValueError:
+        cfg["STOREBOT_POLL_SECONDS"] = 60
     return cfg
 
 
@@ -149,12 +160,16 @@ class StoreBot:
         self.chat_ids = self.cfg["STOREBOT_CHAT_IDS"]
         self.api_base = self.cfg.get("STOREBOT_API_BASE", "https://api.telegram.org").rstrip("/")
         self.digest_hour = self.cfg["STOREBOT_DIGEST_HOUR"]
+        self.poll_seconds = self.cfg["STOREBOT_POLL_SECONDS"]
         self.vendor = self.cfg.get("STOREBOT_VENDOR", "")
         self.state = load_state()
+        if "digest_enabled" in self.state and "alerts_enabled" not in self.state:
+            self.state["alerts_enabled"] = self.state.pop("digest_enabled")
         self.started = time.time()
         self._jwt = ""
         self._jwt_exp = 0.0
         self._rc_projects = None
+        self._last_poll = 0.0
         self.last_status = {"asc": "", "rc": ""}
 
     def run(self):
@@ -516,45 +531,37 @@ class StoreBot:
 
     def _digest_text(self):
         yesterday = date.today() - timedelta(days=1)
-        merged, per_day = self.sales_span(1)
+        merged, _ = self.sales_span(1)
         units = sum(a["units"] for a in merged.values())
-        top = sorted(merged.items(), key=lambda kv: kv[1]["units"], reverse=True)[:5]
+        top = sorted(merged.items(), key=lambda kv: kv[1]["units"], reverse=True)[:3]
         top_line = " · ".join(f"{t} {a['units']}" for t, a in top) or "—"
-        asc_tail = self._proceeds_tail(merged)
 
-        rc_lines, rc_errors = [], []
         rc_total = 0.0
         active = trials = mrr = rev28 = 0
+        errors = []
         for p in self._projects_ok():
             m = self.rc_metrics(p)
             if m is None:
-                rc_errors.append(p["name"])
+                errors.append(p["name"])
                 continue
             v = self.rc_revenue(p, yesterday, yesterday, "proceeds")
+            if v is not None:
+                rc_total += v
             active += m.get("active_subscriptions", 0)
             trials += m.get("active_trials", 0)
             mrr += m.get("mrr", 0)
             rev28 += m.get("revenue", 0)
-            if v is not None:
-                rc_total += v
-                if v:
-                    rc_lines.append(f"{p['name']} {self._fmt_money(v)}")
-        if not rc_lines:
-            rc_lines.append("$0.00 across all projects")
-
-        delta_line = self._delta_line(active, mrr)
         parts = [
-            f"📊 Midgar daily — {date.today().strftime('%a %Y-%m-%d')}",
-            f"📥 Downloads ({yesterday.strftime('%b %d')}): {self._units(units)}{asc_tail}",
-            f"   {top_line}",
-            f"💰 RevenueCat ({yesterday.strftime('%b %d')}, proceeds): {self._fmt_money(rc_total)}",
-            "   " + " · ".join(rc_lines),
-            f"📈 Active {int(active)} · Trials {int(trials)} · MRR {self._fmt_money(mrr)} · 28d rev {self._fmt_money(rev28)}",
+            f"📊 {date.today().strftime('%a %Y-%m-%d')}",
+            f"📥 {self._units(units)} downloads yesterday ({top_line})",
+            f"💰 {self._fmt_money(rc_total)} revenue yesterday",
+            f"📈 {int(active)} active · {int(trials)} trials · MRR {self._fmt_money(mrr)} · 28d {self._fmt_money(rev28)}",
         ]
-        if delta_line:
-            parts.append(delta_line)
-        if rc_errors:
-            parts.append(f"⚠️ no data: {', '.join(rc_errors)}")
+        delta = self._delta_line(active, mrr)
+        if delta:
+            parts.append(delta)
+        if errors:
+            parts.append(f"⚠️ no data: {', '.join(errors)}")
         return "\n".join(parts)
 
     def _delta_line(self, active, mrr):
@@ -592,7 +599,7 @@ class StoreBot:
     def _status_text(self):
         up = time.time() - self.started
         d = datetime.now()
-        enabled = self.state.get("digest_enabled", True)
+        enabled = self.state.get("alerts_enabled", True)
         last = self.state.get("last_digest") or "never"
         today = date.today().isoformat()
         if last == today:
@@ -604,8 +611,8 @@ class StoreBot:
         if not enabled:
             nxt = "off"
         lines = [
-            f"🟢 storebot up {int(up // 3600)}h{int(up % 3600 // 60):02d}m · digest {'ON' if enabled else 'OFF'}",
-            f"Last digest: {last} · Next: {nxt}",
+            f"🟢 storebot up {int(up // 3600)}h{int(up % 3600 // 60):02d}m · alerts {'ON' if enabled else 'OFF'}",
+            f"Revenue pings every {self.poll_seconds}s · Digest: {last} / next {nxt}",
             f"ASC vendor {self.vendor} · RC projects: {len(self._projects_ok())}",
         ]
         if self.last_status["asc"]:
@@ -615,6 +622,47 @@ class StoreBot:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ loop
+
+    def _tick_revenue(self):
+        """Poll RC's realtime revenue metric and ping on new revenue/refunds.
+
+        Baseline is persisted in state, keyed by UTC day, so a restart does not
+        swallow revenue that arrived while the bot was down."""
+        now = time.time()
+        if now - self._last_poll < self.poll_seconds:
+            return
+        self._last_poll = now
+        if not self.state.get("alerts_enabled", True):
+            return
+        utc_today = datetime.now(timezone.utc).date()
+        baseline = self.state.setdefault("revenue_baseline", {})
+        pings = []
+        dirty = False
+        for p in self._projects_ok():
+            v = self.rc_revenue(p, utc_today, utc_today, "proceeds")
+            if v is None:
+                continue
+            b = baseline.get(p["name"])
+            if not b or b.get("day") != utc_today.isoformat():
+                baseline[p["name"]] = {"day": utc_today.isoformat(), "value": v}
+                dirty = True
+                continue
+            delta = v - b["value"]
+            if delta > 0.004:
+                pings.append(f"💰 {p['name']} +{self._fmt_money(delta)} (today {self._fmt_money(v)})")
+                b["value"] = v
+                dirty = True
+            elif delta < -0.004:
+                pings.append(f"⚠️ Refund — {p['name']} {self._fmt_money(delta)} (today {self._fmt_money(v)})")
+                b["value"] = v
+                dirty = True
+        if dirty:
+            save_state(self.state)
+        if pings:
+            text = "\n".join(pings)
+            for chat_id in self.chat_ids:
+                self.send(text, chat_id=chat_id)
+            log(f"revenue ping: {'; '.join(pings)}")
 
     def run_forever(self):
         try:
@@ -626,6 +674,7 @@ class StoreBot:
         log("storebot online")
         while True:
             self._tick_digest()
+            self._tick_revenue()
             try:
                 updates = self.tg_api("getUpdates", {
                     "offset": self.state.get("update_offset", 0), "timeout": 25,
@@ -663,12 +712,16 @@ class StoreBot:
     def _tick_digest(self):
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
-        if not self.state.get("digest_enabled", True):
+        if not self.state.get("alerts_enabled", True):
             return
         if self.state.get("last_digest") == today:
             return
         retry_at = self.state.get("digest_retry_at", 0)
         if now.hour < self.digest_hour or time.time() < retry_at:
+            return
+        if now.hour >= self.digest_hour + 2:
+            self.state["last_digest"] = today
+            save_state(self.state)
             return
         try:
             self._send_digest()
@@ -685,6 +738,8 @@ class StoreBot:
         self._snapshot_now()
         for chat_id in self.chat_ids:
             self.send(text, chat_id=chat_id)
+        self.state["last_digest"] = date.today().isoformat()
+        save_state(self.state)
         self.last_status["rc"] = "digest sent"
         log("digest sent")
 
@@ -714,13 +769,13 @@ class StoreBot:
         elif cmd == "/status":
             self.send(self._status_text())
         elif cmd == "/on":
-            self.state["digest_enabled"] = True
+            self.state["alerts_enabled"] = True
             save_state(self.state)
-            self.send(f"Daily digest ON — sends at {self.digest_hour:02d}:00 daily.")
+            self.send(f"Alerts ON — revenue pings live, digest at {self.digest_hour:02d}:00 daily.")
         elif cmd == "/off":
-            self.state["digest_enabled"] = False
+            self.state["alerts_enabled"] = False
             save_state(self.state)
-            self.send("Daily digest OFF. /on to re-enable.")
+            self.send("Alerts OFF (revenue pings + daily digest). /on to re-enable.")
         elif cmd.startswith("/"):
             self.send("Unknown command. /help")
         else:
@@ -821,8 +876,8 @@ COMMANDS = [
     ("apps", "per-app subscription snapshot"),
     ("digest", "send the daily digest now"),
     ("status", "bot health"),
-    ("on", "enable daily digest"),
-    ("off", "disable daily digest"),
+    ("on", "enable alerts (revenue pings + digest)"),
+    ("off", "disable alerts"),
     ("help", "list commands"),
 ]
 
