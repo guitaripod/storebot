@@ -2,10 +2,14 @@
 """storebot — Telegram bot pinging Midgar's App Store + RevenueCat revenue.
 
 Long-polls a dedicated Telegram bot. Core feature: a revenue watcher that polls
-RevenueCat's realtime revenue metric (default every 60s) and pings the moment a
-project earns money (refunds are tracked silently):
+RevenueCat's realtime revenue metric (default every 60s) and celebrates the
+moment a project earns money (refunds are tracked silently):
 
-  💰 Solar Beam +$6.00 (today $6.00)
+  ☀️ Solar Beam: +$6.00 — the sun pays off
+  🎊 Today crossed $10 — customers are vibing
+
+Ping lines are randomized per app pun and amount tier; daily revenue
+milestones fire once each.
 
 Plus on-demand commands and one lean daily digest (default 09:00 local):
 
@@ -46,6 +50,7 @@ import gzip
 import io
 import json
 import os
+import random
 import re
 import signal
 import sys
@@ -71,6 +76,77 @@ STATE_FILE = HOME / ".local/state/storebot/state.json"
 LOG_DIR = HOME / ".local/state/storebot"
 
 TG_MAX_LEN = 4000
+
+APP_PUNS = {
+    "solar beam": [
+        "☀️ {app}: +{d} — the sun pays off",
+        "🔆 {app}: +{d} — solar-powered revenue",
+    ],
+    "living dex": [
+        "🦎 {app}: +{d} — a creature just funded itself",
+        "🦋 {app}: +{d} — the wild paid up",
+    ],
+    "psybeam": [
+        "⚡ {app}: +{d} — a beam of cash",
+        "🗣️ {app}: +{d} — translation pays",
+    ],
+    "psywave": [
+        "🌊 {app}: +{d} — good vibes, good cash",
+        "🧠 {app}: +{d} — brainwaves turned banknotes",
+    ],
+    "dream": [
+        "😴 {app}: +{d} — someone's nightmares just paid rent",
+        "💭 {app}: +{d} — sweet dreams, sweeter cash",
+    ],
+    "dead": [
+        "💀 {app}: +{d} — the dead are generous",
+        "🪦 {app}: +{d} — graveyard money, best money",
+    ],
+    "kick": [
+        "🥋 {app}: +{d} — a double kick of cash",
+        "🦵 {app}: +{d} — kicked some money your way",
+    ],
+    "helia": [
+        "🌞 {app}: +{d} — the sun coach scores",
+        "🌤️ {app}: +{d} — somebody got generous with the UV index",
+    ],
+    "pay": [
+        "💵 {app}: +{d} — literally payday",
+        "🤑 {app}: +{d} — Pay Day paying off",
+    ],
+}
+
+TIER_LINES = {
+    (0, 1): [
+        "🪙 {app}: +{d} — pocket change from a real fan",
+        "💫 {app}: +{d} — a little spark",
+    ],
+    (1, 5): [
+        "☕ {app}: +{d} — coffee's on them",
+        "🎯 {app}: +{d} — small but loud",
+    ],
+    (5, 15): [
+        "🍕 {app}: +{d} — dinner's on the customer",
+        "🚀 {app}: +{d} — nice one",
+    ],
+    (15, 40): [
+        "🎉 {app}: +{d} — now we're talking",
+        "🥂 {app}: +{d} — pop something open",
+    ],
+    (40, float("inf")): [
+        "🐳 {app}: +{d} — WHALE ALERT 🚨",
+        "👑 {app}: +{d} — a true believer",
+    ],
+}
+
+MILESTONES = [
+    (10, "🎊 Today crossed $10 — customers are vibing"),
+    (25, "🥳 $25 today — the machine is waking up"),
+    (50, "🚀 $50 today — legit momentum"),
+    (100, "💯 $100 today — three figures, baby"),
+    (250, "👑 $250 today — Midgar eats"),
+    (500, "🐐 $500 today — GOAT behavior"),
+]
 
 
 def log(msg, level="INFO"):
@@ -399,6 +475,18 @@ class StoreBot:
     def _units(n):
         return f"{n} unit" if n == 1 else f"{n} units"
 
+    def _celebrate(self, name, delta):
+        """One-line celebration for a revenue bump: app pun first, else a
+        size-tiered line."""
+        name_l = name.lower()
+        for key, puns in APP_PUNS.items():
+            if key in name_l and random.random() < 0.4:
+                return random.choice(puns).format(app=name, d=self._fmt_money(delta))
+        for (lo, hi), lines in sorted(TIER_LINES.items()):
+            if lo <= delta < hi:
+                return random.choice(lines).format(app=name, d=self._fmt_money(delta))
+        return f"💰 {name} +{self._fmt_money(delta)}"
+
     def _projects_ok(self):
         return [p for p in self.rc_projects() if "project_id" in p]
 
@@ -637,10 +725,12 @@ class StoreBot:
         baseline = self.state.setdefault("revenue_baseline", {})
         pings = []
         dirty = False
+        total_today = 0.0
         for p in self._projects_ok():
             v = self.rc_revenue(p, utc_today, utc_today, "proceeds")
             if v is None:
                 continue
+            total_today += v
             b = baseline.get(p["name"])
             if not b or b.get("day") != utc_today.isoformat():
                 baseline[p["name"]] = {"day": utc_today.isoformat(), "value": v}
@@ -648,11 +738,21 @@ class StoreBot:
                 continue
             delta = v - b["value"]
             if delta > 0.004:
-                pings.append(f"💰 {p['name']} +{self._fmt_money(delta)} (today {self._fmt_money(v)})")
+                pings.append(self._celebrate(p["name"], delta))
                 b["value"] = v
                 dirty = True
             elif delta < -0.004:
                 b["value"] = v
+                dirty = True
+        milestones = self.state.get("milestones")
+        if not milestones or milestones.get("day") != utc_today.isoformat():
+            milestones = {"day": utc_today.isoformat(), "crossed": []}
+            self.state["milestones"] = milestones
+            dirty = True
+        for threshold, line in MILESTONES:
+            if total_today >= threshold and threshold not in milestones["crossed"]:
+                milestones["crossed"].append(threshold)
+                pings.append(line)
                 dirty = True
         if dirty:
             save_state(self.state)
