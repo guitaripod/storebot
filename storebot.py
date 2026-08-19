@@ -5,11 +5,11 @@ Long-polls a dedicated Telegram bot. Core feature: a revenue watcher that polls
 RevenueCat's realtime revenue metric (default every 60s) and celebrates the
 moment a project earns money (refunds are tracked silently):
 
-  ☀️ Solar Beam: +$6.00 — the sun pays off
-  🎊 Today crossed $10 — customers are vibing
+  ☀️ Solar Beam: +$6.00
+  🎊 Today crossed $10
 
-Ping lines are randomized per app pun and amount tier; daily revenue
-milestones fire once each.
+Emoji are randomized per app and amount tier; daily revenue milestones fire
+once each.
 
 Plus on-demand commands and one lean daily digest (default 09:00 local):
 
@@ -79,75 +79,33 @@ LOG_DIR = HOME / ".local/state/storebot"
 
 TG_MAX_LEN = 4000
 
-APP_PUNS = {
-    "solar beam": [
-        "☀️ {app}: +{d} — the sun pays off",
-        "🔆 {app}: +{d} — solar-powered revenue",
-    ],
-    "living dex": [
-        "🦎 {app}: +{d} — a creature just funded itself",
-        "🦋 {app}: +{d} — the wild paid up",
-    ],
-    "psybeam": [
-        "⚡ {app}: +{d} — a beam of cash",
-        "🗣️ {app}: +{d} — translation pays",
-    ],
-    "psywave": [
-        "🌊 {app}: +{d} — good vibes, good cash",
-        "🧠 {app}: +{d} — brainwaves turned banknotes",
-    ],
-    "dream": [
-        "😴 {app}: +{d} — someone's nightmares just paid rent",
-        "💭 {app}: +{d} — sweet dreams, sweeter cash",
-    ],
-    "dead": [
-        "💀 {app}: +{d} — the dead are generous",
-        "🪦 {app}: +{d} — graveyard money, best money",
-    ],
-    "kick": [
-        "🥋 {app}: +{d} — a double kick of cash",
-        "🦵 {app}: +{d} — kicked some money your way",
-    ],
-    "helia": [
-        "🌞 {app}: +{d} — the sun coach scores",
-        "🌤️ {app}: +{d} — somebody got generous with the UV index",
-    ],
-    "pay": [
-        "💵 {app}: +{d} — literally payday",
-        "🤑 {app}: +{d} — Pay Day paying off",
-    ],
+APP_EMOJI = {
+    "solar beam": ["☀️", "🔆"],
+    "living dex": ["🦎", "🦋"],
+    "psybeam": ["⚡", "🗣️"],
+    "psywave": ["🌊", "🧠"],
+    "dream": ["😴", "💭"],
+    "dead": ["💀", "🪦"],
+    "kick": ["🥋", "🦵"],
+    "helia": ["🌞", "🌤️"],
+    "pay": ["💵", "🤑"],
 }
 
-TIER_LINES = {
-    (0, 1): [
-        "🪙 {app}: +{d} — pocket change from a real fan",
-        "💫 {app}: +{d} — a little spark",
-    ],
-    (1, 5): [
-        "☕ {app}: +{d} — coffee's on them",
-        "🎯 {app}: +{d} — small but loud",
-    ],
-    (5, 15): [
-        "🍕 {app}: +{d} — dinner's on the customer",
-        "🚀 {app}: +{d} — nice one",
-    ],
-    (15, 40): [
-        "🎉 {app}: +{d} — now we're talking",
-        "🥂 {app}: +{d} — pop something open",
-    ],
-    (40, float("inf")): [
-        "🐳 {app}: +{d} — WHALE ALERT 🚨",
-        "👑 {app}: +{d} — a true believer",
-    ],
+TIER_EMOJI = {
+    (0, 1): ["🪙", "💫"],
+    (1, 5): ["☕", "🎯"],
+    (5, 15): ["🍕", "🚀"],
+    (15, 40): ["🎉", "🥂"],
+    (40, float("inf")): ["🐳", "👑"],
 }
 
 MILESTONES = [
-    (10, "🎊 Today crossed $10 — customers are vibing"),
-    (25, "🥳 $25 today — the machine is waking up"),
-    (50, "🚀 $50 today — legit momentum"),
-    (100, "💯 $100 today — three figures, baby"),
-    (250, "👑 $250 today — Midgar eats"),
-    (500, "🐐 $500 today — GOAT behavior"),
+    (10, "🎊 Today crossed $10"),
+    (25, "🥳 $25 today"),
+    (50, "🚀 $50 today"),
+    (100, "💯 $100 today"),
+    (250, "👑 $250 today"),
+    (500, "🐐 $500 today"),
 ]
 
 
@@ -591,15 +549,15 @@ class StoreBot:
         return f"{n} unit" if n == 1 else f"{n} units"
 
     def _celebrate(self, name, delta):
-        """One-line celebration for a revenue bump: app pun first, else a
-        size-tiered line."""
+        """One-line celebration for a revenue bump: per-app emoji, else a
+        size-tiered emoji."""
         name_l = name.lower()
-        for key, puns in APP_PUNS.items():
-            if key in name_l and random.random() < 0.4:
-                return random.choice(puns).format(app=name, d=self._fmt_money(delta))
-        for (lo, hi), lines in sorted(TIER_LINES.items()):
+        for key, emojis in APP_EMOJI.items():
+            if key in name_l:
+                return f"{random.choice(emojis)} {name}: +{self._fmt_money(delta)}"
+        for (lo, hi), emojis in sorted(TIER_EMOJI.items()):
             if lo <= delta < hi:
-                return random.choice(lines).format(app=name, d=self._fmt_money(delta))
+                return f"{random.choice(emojis)} {name}: +{self._fmt_money(delta)}"
         return f"💰 {name} +{self._fmt_money(delta)}"
 
     def _projects_ok(self):
