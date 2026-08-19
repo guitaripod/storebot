@@ -3,10 +3,9 @@
 
 Long-polls a dedicated Telegram bot. Core feature: a revenue watcher that polls
 RevenueCat's realtime revenue metric (default every 60s) and pings the moment a
-project earns money — or logs a refund:
+project earns money (refunds are tracked silently):
 
   💰 Solar Beam +$6.00 (today $6.00)
-  ⚠️ Refund — Solar Beam -$6.00 (today $0.00)
 
 Plus on-demand commands and one lean daily digest (default 09:00 local):
 
@@ -653,7 +652,6 @@ class StoreBot:
                 b["value"] = v
                 dirty = True
             elif delta < -0.004:
-                pings.append(f"⚠️ Refund — {p['name']} {self._fmt_money(delta)} (today {self._fmt_money(v)})")
                 b["value"] = v
                 dirty = True
         if dirty:

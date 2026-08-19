@@ -3,12 +3,11 @@
 Telegram bot pinging Midgar's **App Store sales** and **RevenueCat** revenue.
 
 **Core feature — revenue pings.** Every ~60s it polls RevenueCat's realtime
-revenue metric (per project) and pings the chat the moment money lands — or a
-refund hits:
+revenue metric (per project) and pings the chat the moment money lands.
+Refunds are tracked silently — only good news makes it to the chat:
 
 ```
 💰 Solar Beam +$6.00 (today $6.00)
-⚠️ Refund — Solar Beam -$6.00 (today $0.00)
 ```
 
 Baselines are persisted per UTC day, so restarts don't swallow revenue earned
