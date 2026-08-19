@@ -1,0 +1,13 @@
+[Unit]
+Description=storebot - Telegram App Store + RevenueCat sales reporting
+After=network-online.target
+
+[Service]
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/.local/share/swiftly/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/opt/cuda/bin:/var/lib/flatpak/exports/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/usr/lib/rustup/bin
+EnvironmentFile=%h/.config/storebot/secrets.env
+ExecStart=%h/Dev/storebot/storebot.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
