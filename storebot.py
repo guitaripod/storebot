@@ -41,6 +41,8 @@ plain KEY=value lines accepted):
 CLI:
   --selftest     validate the data layer (ASC + RevenueCat) and exit
   --digest-now   send the daily digest and exit
+  --replay       walk every project's purchase + renewal history and send the
+                 real revenue events as celebratory lines (one-off, ~10 min)
   --send TEXT    send one raw message and exit
 """
 
@@ -261,6 +263,9 @@ class StoreBot:
         if "--digest-now" in sys.argv:
             self._send_digest()
             return 0
+        if "--replay" in sys.argv:
+            self._replay()
+            return 0
         self.run_forever()
         return 0
 
@@ -412,7 +417,8 @@ class StoreBot:
     # -------------------------------------------------------------------- rc
 
     def rc_get(self, secret, path, params=None, timeout=45):
-        r = requests.get(RC_BASE + path, params=params, timeout=timeout,
+        url = path if path.startswith("http") else RC_BASE + path
+        r = requests.get(url, params=params, timeout=timeout,
                          headers={"Authorization": f"Bearer {secret}"})
         r.raise_for_status()
         return r.json()
@@ -464,6 +470,115 @@ class StoreBot:
         except (requests.HTTPError, requests.RequestException) as e:
             log(f"rc revenue {project['name']}: {e}", "WARN")
             return None
+
+    def _rc_get_paced(self, secret, path, params=None):
+        """rc_get with a throttle + 429 backoff, for full-history walks that
+        would otherwise blow the customer-information rate limit."""
+        for attempt in range(4):
+            time.sleep(0.13)
+            try:
+                return self.rc_get(secret, path, params)
+            except requests.HTTPError as e:
+                if e.response.status_code != 429 or attempt == 3:
+                    raise
+                time.sleep(3 * (attempt + 1))
+        return None
+
+    def _history_events(self, project):
+        """All real (production, non-refunded, non-zero) revenue events for one
+        RC project: one-time + subscription purchases plus every renewal.
+
+        Returns [(timestamp_ms, proceeds_usd, product_display_name), ...]."""
+        products = {}
+        pnext = f"/projects/{project['project_id']}/products?limit=200"
+        while pnext:
+            pdata = self._rc_get_paced(project["secret"], pnext)
+            for prod in (pdata or {}).get("items") or []:
+                name = (prod.get("display_name") or "").strip()
+                if name:
+                    products[prod.get("id")] = name
+                    if prod.get("store_identifier"):
+                        products[prod["store_identifier"]] = name
+            pnext = (pdata or {}).get("next_page")
+        events = []
+        initial_txn_ids = set()
+        cnext = f"/projects/{project['project_id']}/customers?limit=200"
+        while cnext:
+            cdata = self._rc_get_paced(project["secret"], cnext)
+            for c in (cdata or {}).get("items") or []:
+                cid = c["id"]
+                sub_next = (f"/projects/{project['project_id']}/customers/{cid}"
+                            f"/subscriptions?environment=production&limit=200")
+                while sub_next:
+                    sdata = self._rc_get_paced(project["secret"], sub_next)
+                    for sub in (sdata or {}).get("items") or []:
+                        sid = sub["id"]
+                        if sub.get("store") not in ("app_store", "play_store", "mac_app_store"):
+                            total = (sub.get("total_revenue_in_usd") or {}).get("proceeds") or 0
+                            if total > 0.004:
+                                events.append((sub.get("starts_at") or 0, total, ""))
+                            continue
+                        tnext = (f"/projects/{project['project_id']}/subscriptions/{sid}"
+                                 f"/transactions?sort=purchased_at&direction=asc&limit=200")
+                        while tnext:
+                            tdata = self._rc_get_paced(project["secret"], tnext)
+                            txns = (tdata or {}).get("items") or []
+                            for i, txn in enumerate(txns):
+                                if i == 0:
+                                    initial_txn_ids.add(txn.get("id"))
+                                rev = (txn.get("revenue_in_usd") or {}).get("proceeds") or 0
+                                if rev <= 0.004:
+                                    continue
+                                sku = txn.get("product_store_identifier") or ""
+                                events.append((txn.get("purchased_at") or 0, rev,
+                                               products.get(sku, "")))
+                            tnext = (tdata or {}).get("next_page")
+                    sub_next = (sdata or {}).get("next_page")
+                buy_next = (f"/projects/{project['project_id']}/customers/{cid}"
+                            f"/purchases?environment=production&limit=200")
+                while buy_next:
+                    bdata = self._rc_get_paced(project["secret"], buy_next)
+                    for purch in (bdata or {}).get("items") or []:
+                        if purch.get("status") == "refunded":
+                            continue
+                        if purch.get("store_purchase_identifier") in initial_txn_ids:
+                            continue
+                        rev = (purch.get("revenue_in_usd") or {}).get("proceeds") or 0
+                        if rev <= 0.004:
+                            continue
+                        events.append((purch.get("purchased_at") or 0, rev,
+                                       products.get(purch.get("product_id"), "")))
+                    buy_next = (bdata or {}).get("next_page")
+            cnext = (cdata or {}).get("next_page")
+        events.sort()
+        return events
+
+    def _replay(self):
+        for p in self._projects_ok():
+            try:
+                events = self._history_events(p)
+            except (requests.HTTPError, requests.RequestException) as e:
+                log(f"history {p['name']}: {e}", "WARN")
+                continue
+            if not events:
+                log(f"history {p['name']}: no events")
+                continue
+            first = datetime.fromtimestamp(events[0][0] / 1000)
+            last = datetime.fromtimestamp(events[-1][0] / 1000)
+            header = (f"📜 {p['name']} — {len(events)} events · "
+                      f"{first.strftime('%b %d')} → {last.strftime('%b %d')}")
+            lines = []
+            for ts, rev, product in events:
+                label = p["name"]
+                if product and p["name"].lower() in product.lower():
+                    label = product[:40]
+                elif product:
+                    label = f"{p['name']} · {product[:24]}"
+                lines.append(self._celebrate(label, rev))
+            for chunk in self._chunks("\n".join([header, *lines])):
+                for chat_id in self.chat_ids:
+                    self.send(chunk, chat_id=chat_id)
+            log(f"history {p['name']}: sent {len(events)} events")
 
     # ------------------------------------------------------------------ texts
 
