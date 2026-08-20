@@ -2,44 +2,52 @@
 
 Telegram bot that tells Marcus the moment a sale lands. Nothing else.
 
-**RevenueCat sales** (IAP + subscriptions): polls the realtime revenue metric
-every ~60s per project and pings on any increase — emoji per app/amount, no
-punchlines:
+**RevenueCat sales** — per-sale detail via the RC webhook relay
+(`storebot-hook`, a Cloudflare Worker): product, price, buyer's country, plus
+tags:
+
+- `🆕` new subscriber / one-time purchase, `🔁` renewal, `🌱` trial → paid
+- `🐣 first-ever` the project's first-ever sale, `🌅 1st today` first of the day
 
 ```
-☀️ Solar Beam: +$6.00
+🆕 🐣 first-ever 🌅 1st today 🇫🇮 App of the Dead · Greek Guides: +€2.99
+🌱 🔁 🇺🇸 Helia: Solar Coach · Pro (Monthly): +$9.99
 ```
 
-**Paid-app sales** (invisible to RevenueCat, e.g. SForesight): checks the App
-Store sales report once a day (default 09:00) and pings only when a paid
-download actually landed:
+A 60s revenue-metric poll stays as fallback (app-level deltas only, no
+detail) and suppresses itself for 30 min around webhook deliveries so nothing
+double-pings. Refunds are tracked silently.
 
-```
-📦 SForesight: +$9.99 USD
-```
+**Paid-app sales** (invisible to RevenueCat, e.g. SForesight): App Store sales
+report checked once a day (default 09:00); pings only when a paid download
+actually landed.
 
-Refunds are tracked silently. Daily revenue milestones ride along with the
-pings. Commands: `/status`, `/on`, `/off`, `/help`.
+**App reviews**: App Store Connect customerReviews polled every 30 min; new
+5★ and 1★ reviews ping. First run baselines silently — history never
+replays.
+
+Commands: `/status`, `/on`, `/off`, `/help`.
 
 ## Install
 
 ```sh
 ./install.sh                                  # symlink service + template secrets.env
-# fill ~/.config/storebot/secrets.env (token from @BotFather, chat id, vendor)
+# fill ~/.config/storebot/secrets.env
 systemctl --user enable --now storebot
 ```
 
-Config is read from `~/.config/storebot/secrets.env` (bot-specific;
-`STOREBOT_POLL_SECONDS` tunes ping cadence, default 60;
-`STOREBOT_DIGEST_HOUR` = App Store check hour, default 9) and
-`~/.config/midgar/credentials.env` (ASC + RevenueCat secrets; every
-`RC_SECRET_*` project is auto-discovered). Both are parsed by the bot itself,
-so `export KEY=value`, quotes and inline comments all work.
+Config is read from `~/.config/storebot/secrets.env` (bot-specific:
+`STOREBOT_POLL_SECONDS`, `STOREBOT_HOOK_SECONDS`, `STOREBOT_REVIEW_SECONDS`,
+`STOREBOT_HOOK_URL`, `STOREBOT_HOOK_SECRET`, `STOREBOT_DIGEST_HOUR`,
+`STOREBOT_VENDOR`) and `~/.config/midgar/credentials.env` (ASC + RevenueCat
+secrets; every `RC_SECRET_*` project is auto-discovered). Both files are
+parsed by the bot itself, so `export KEY=value`, quotes and inline comments
+all work.
 
 ## Checks
 
 ```sh
-python3 storebot.py --selftest     # validate ASC + RevenueCat data layer
+python3 storebot.py --selftest     # validate ASC + RC + relay data layer
 python3 storebot.py --replay       # one-off: send all real history events as pings
 python3 storebot.py --send "test"  # send one raw message
 ```

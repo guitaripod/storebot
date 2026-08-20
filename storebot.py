@@ -3,25 +3,38 @@
 
 Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
 
-  - RevenueCat sales (IAP, subscriptions): polls the realtime revenue metric
-    every ~60s per project and pings on any increase, emoji + amount:
+  - RevenueCat sales: two paths. Primary is the RC webhook relay (a Cloudflare
+    Worker: storebot-hook), which delivers per-sale detail — product, price,
+    buyer's country, new vs renewal vs trial conversion, first-of-day and
+    first-ever-sale markers:
 
-      ☀️ Solar Beam: +$6.00
+      🆕 🇫🇮 Solar Beam · Premium (Annual): +€39.99
+      🌱 🔁 Helia: Solar Coach · Pro (Monthly): +$9.99
+      🐣 First-ever sale — PayDay · Pro (Annual): +€59.99
+
+    The 60s revenue-metric poll stays as fallback (pings app-level deltas only
+    when a project has no webhook or the relay is down) and suppresses itself
+    around webhook deliveries so nothing double-pings.
 
   - Paid-app sales (invisible to RevenueCat, e.g. SForesight): checks the App
     Store sales report once a day (default 09:00) and pings only when a paid
-    app download actually landed:
+    app download actually landed.
 
-      📦 SForesight: +$9.99 USD
+  - App reviews: polls App Store Connect customerReviews and pings new 5★ and
+    1★ reviews (default every 30 min).
 
-Refunds are tracked silently. Daily revenue milestones (once each) ride along
-with the pings. Control commands: /status, /on, /off, /help.
+Refunds are tracked silently. Daily revenue milestones ride along with pings.
+Control commands: /status, /on, /off, /help.
 
 Config (both files parsed by the bot itself; sourceable `export KEY=value` and
 plain KEY=value lines accepted):
   ~/.config/storebot/secrets.env   STOREBOT_TOKEN, STOREBOT_CHAT_IDS,
                                    STOREBOT_DIGEST_HOUR (default 9, App Store check hour),
                                    STOREBOT_POLL_SECONDS (default 60),
+                                   STOREBOT_HOOK_SECONDS (default 30),
+                                   STOREBOT_REVIEW_SECONDS (default 1800),
+                                   STOREBOT_HOOK_URL (webhook relay worker),
+                                   STOREBOT_HOOK_SECRET (relay + RC webhook auth),
                                    STOREBOT_VENDOR (ASC vendor number),
                                    STOREBOT_API_BASE (default https://api.telegram.org)
   ~/.config/midgar/credentials.env ASC_KEY_ID, ASC_ISSUER_ID,
@@ -96,6 +109,16 @@ MILESTONES = [
     (500, "🐐 $500 today"),
 ]
 
+CURRENCY_SYMBOLS = {
+    "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥", "KRW": "₩",
+    "SEK": "kr", "NOK": "kr", "DKK": "kr", "PLN": "zł", "CAD": "C$",
+    "AUD": "A$", "NZD": "NZ$", "CHF": "Fr.", "CZK": "Kč", "BRL": "R$",
+    "INR": "₹", "MXN": "MX$", "TRY": "₺", "HKD": "HK$", "SGD": "S$",
+    "RUB": "₽", "ZAR": "R", "RON": "lei", "UAH": "₴", "MYR": "RM", "COP": "CO$",
+}
+
+MONEY_EVENT_TYPES = {"INITIAL_PURCHASE", "RENEWAL", "NON_RENEWING_PURCHASE"}
+
 
 def log(msg, level="INFO"):
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {msg}"
@@ -149,6 +172,14 @@ def load_config():
         cfg["STOREBOT_POLL_SECONDS"] = int(cfg.get("STOREBOT_POLL_SECONDS", "60"))
     except ValueError:
         cfg["STOREBOT_POLL_SECONDS"] = 60
+    try:
+        cfg["STOREBOT_HOOK_SECONDS"] = int(cfg.get("STOREBOT_HOOK_SECONDS", "30"))
+    except ValueError:
+        cfg["STOREBOT_HOOK_SECONDS"] = 30
+    try:
+        cfg["STOREBOT_REVIEW_SECONDS"] = int(cfg.get("STOREBOT_REVIEW_SECONDS", "1800"))
+    except ValueError:
+        cfg["STOREBOT_REVIEW_SECONDS"] = 1800
     return cfg
 
 
@@ -184,6 +215,10 @@ class StoreBot:
         self.api_base = self.cfg.get("STOREBOT_API_BASE", "https://api.telegram.org").rstrip("/")
         self.digest_hour = self.cfg["STOREBOT_DIGEST_HOUR"]
         self.poll_seconds = self.cfg["STOREBOT_POLL_SECONDS"]
+        self.hook_seconds = self.cfg["STOREBOT_HOOK_SECONDS"]
+        self.review_seconds = self.cfg["STOREBOT_REVIEW_SECONDS"]
+        self.hook_url = self.cfg.get("STOREBOT_HOOK_URL", "").rstrip("/")
+        self.hook_secret = self.cfg.get("STOREBOT_HOOK_SECRET", "")
         self.vendor = self.cfg.get("STOREBOT_VENDOR", "")
         self.state = load_state()
         if "digest_enabled" in self.state and "alerts_enabled" not in self.state:
@@ -193,6 +228,11 @@ class StoreBot:
         self._jwt_exp = 0.0
         self._rc_projects = None
         self._last_poll = 0.0
+        self._last_hook = 0.0
+        self._last_review = 0.0
+        self._products_cache = {}
+        self._apps_cache = None
+        self._ever_sold_seeded = False
 
     def run(self):
         if "--selftest" in sys.argv:
@@ -287,6 +327,12 @@ class StoreBot:
         self._jwt = signing_input + "." + _b64(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
         self._jwt_exp = payload["exp"]
         return self._jwt
+
+    def asc_get(self, path):
+        r = requests.get("https://api.appstoreconnect.apple.com" + path, timeout=60,
+                         headers={"Authorization": f"Bearer {self.asc_jwt()}"})
+        r.raise_for_status()
+        return r.json()
 
     def asc_sales(self, day, frequency="DAILY"):
         """Fetch one day's SALES/SUMMARY report as a list of row dicts, or None
@@ -497,11 +543,226 @@ class StoreBot:
         enabled = self.state.get("alerts_enabled", True)
         return "\n".join([
             f"🟢 storebot up {int(up // 3600)}h{int(up % 3600 // 60):02d}m · alerts {'ON' if enabled else 'OFF'}",
-            f"Revenue pings every {self.poll_seconds}s · App Store check daily {self.digest_hour:02d}:00",
+            f"Webhooks every {self.hook_seconds}s · revenue fallback {self.poll_seconds}s · reviews {self.review_seconds}s · App Store check daily {self.digest_hour:02d}:00",
             f"RC projects: {len(self._projects_ok())}",
         ])
 
+    # ------------------------------------------------------------------ hook
+
+    @staticmethod
+    def _flag(country):
+        code = (country or "").strip().upper()
+        if len(code) == 3 and code.isalpha():
+            code = code[:2]
+        if len(code) != 2 or not code.isalpha():
+            return ""
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
+
+    @staticmethod
+    def _money(amount, currency):
+        code = (currency or "USD").upper()
+        symbol = CURRENCY_SYMBOLS.get(code)
+        if symbol:
+            return f"+{symbol}{amount:,.2f}"
+        return f"+{code} {amount:,.2f}"
+
+    def _products(self, project):
+        """{product key -> display name} for one project, cached 24h."""
+        entry = self._products_cache.get(project["project_id"])
+        if entry and time.time() - entry["at"] < 86400:
+            return entry["map"]
+        products = {}
+        pnext = f"/projects/{project['project_id']}/products?limit=200"
+        try:
+            while pnext:
+                data = self.rc_get(project["secret"], pnext)
+                for prod in (data or {}).get("items") or []:
+                    name = (prod.get("display_name") or "").strip()
+                    if not name:
+                        continue
+                    products[prod.get("id")] = name
+                    if prod.get("store_identifier"):
+                        products[prod["store_identifier"]] = name
+                pnext = (data or {}).get("next_page")
+            self._products_cache[project["project_id"]] = {"at": time.time(), "map": products}
+        except requests.RequestException as e:
+            log(f"products {project['name']}: {e}", "WARN")
+        return products
+
+    def _seed_ever_sold(self):
+        """Mark projects that already have revenue so their next sale is not
+        mistaken for a first-ever one."""
+        ever = self.state.setdefault("ever_sold", {})
+        for p in self._projects_ok():
+            if ever.get(p["name"]):
+                continue
+            m = self.rc_metrics(p)
+            if m and m.get("revenue", 0) > 0:
+                ever[p["name"]] = True
+        save_state(self.state)
+
+    def _hook_line(self, project, event):
+        ev_type = event.get("type") or ""
+        if ev_type not in MONEY_EVENT_TYPES:
+            return None
+        if (event.get("environment") or "").upper() != "PRODUCTION":
+            return None
+        price = event.get("price_in_purchased_currency") or event.get("price") or 0
+        if price <= 0:
+            return None
+        if ev_type == "RENEWAL" and event.get("is_trial_conversion"):
+            tag = "🌱"
+        elif ev_type == "RENEWAL":
+            tag = "🔁"
+        else:
+            tag = "🆕"
+        ever = self.state.setdefault("ever_sold", {})
+        if not ever.get(project["name"]):
+            ever[project["name"]] = True
+            tag += " 🐣 first-ever"
+        days = self.state.setdefault("sale_days", {})
+        day = datetime.fromtimestamp((event.get("event_timestamp_ms") or 0) / 1000,
+                                     tz=timezone.utc).date().isoformat()
+        if days.get(project["name"]) != day:
+            days[project["name"]] = day
+            tag += " 🌅 1st today"
+        products = self._products(project)
+        product = products.get(event.get("product_id") or "", "")
+        label = project["name"]
+        if product and project["name"].lower() in product.lower():
+            label = product[:40]
+        elif product:
+            label = f"{project['name']} · {product[:28]}"
+        flag = self._flag(event.get("country_code"))
+        return f"{tag} {flag} {label}: {self._money(price, event.get('currency'))}".strip()
+
+    def _tick_hook(self):
+        """Drain the webhook relay queue and turn each sale into a ping."""
+        now = time.time()
+        if now - self._last_hook < self.hook_seconds or not self.hook_url:
+            return
+        self._last_hook = now
+        if not self.state.get("alerts_enabled", True):
+            return
+        if not self._ever_sold_seeded:
+            self._seed_ever_sold()
+            self._ever_sold_seeded = True
+        try:
+            r = requests.get(f"{self.hook_url}/events", timeout=30,
+                             headers={"X-Hook-Secret": self.hook_secret})
+            r.raise_for_status()
+            events = (r.json() or {}).get("events") or []
+        except requests.RequestException as e:
+            log(f"hook fetch: {e}", "WARN")
+            return
+        if not events:
+            return
+        processed = self.state.setdefault("seen_events", [])
+        seen = set(processed)
+        pings = []
+        affected = set()
+        for entry in events:
+            event_id = entry.get("event_id") or ""
+            project_name = (entry.get("project") or "").strip()
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            slug = project_name.lower()
+            project = next((p for p in self._projects_ok()
+                            if p["env"].replace("RC_SECRET_", "").lower() == slug), None)
+            if project is None:
+                log(f"hook event for unknown project {project_name!r}", "WARN")
+                continue
+            try:
+                event = json.loads(entry.get("payload") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            line = self._hook_line(project, event)
+            if line:
+                pings.append(line)
+                affected.add(project["name"])
+        self.state["seen_events"] = (processed + list(seen - set(processed)))[-1000:]
+        save_state(self.state)
+        if affected:
+            suppress = self.state.setdefault("hook_suppress", {})
+            for name in affected:
+                suppress[name] = time.time() + 1800
+            save_state(self.state)
+        if pings:
+            text = "\n".join(pings)
+            for chat_id in self.chat_ids:
+                self.send(text, chat_id=chat_id)
+            log(f"hook pings: {'; '.join(pings)}")
+        try:
+            ids = [e["id"] for e in events]
+            requests.post(f"{self.hook_url}/ack", timeout=30, json={"ids": ids},
+                          headers={"X-Hook-Secret": self.hook_secret})
+        except requests.RequestException as e:
+            log(f"hook ack: {e}", "WARN")
+
+    # ----------------------------------------------------------------- reviews
+
+    def _tick_reviews(self):
+        """Poll App Store Connect customerReviews; ping new 5★ and 1★ only.
+
+        First run baselines silently so history never replays."""
+        now = time.time()
+        if now - self._last_review < self.review_seconds:
+            return
+        self._last_review = now
+        if not self.state.get("alerts_enabled", True):
+            return
+        try:
+            if self._apps_cache is None or time.time() - self._apps_cache["at"] > 86400:
+                data = self.asc_get("/v1/apps?limit=200")
+                self._apps_cache = {"at": time.time(), "apps": data.get("data") or []}
+        except requests.RequestException as e:
+            log(f"apps list: {e}", "WARN")
+            return
+        seen = self.state.setdefault("reviews_seen", {})
+        pings = []
+        for app in self._apps_cache["apps"]:
+            app_id = app["id"]
+            name = app["attributes"].get("name", "?")
+            try:
+                data = self.asc_get(f"/v1/apps/{app_id}/customerReviews?limit=50")
+            except requests.RequestException as e:
+                log(f"reviews {name}: {e}", "WARN")
+                continue
+            reviews = data.get("data") or []
+            if not reviews:
+                continue
+            known = set(seen.get(app_id) or [])
+            fresh = [rv for rv in reviews if rv["id"] not in known]
+            if app_id not in seen:
+                seen[app_id] = [rv["id"] for rv in reviews][-200:]
+                save_state(self.state)
+                continue
+            if fresh:
+                seen[app_id] = (seen[app_id] + [rv["id"] for rv in fresh])[-200:]
+                save_state(self.state)
+            for rv in fresh:
+                attrs = rv["attributes"]
+                rating = attrs.get("rating")
+                if rating not in (1, 5):
+                    continue
+                title = (attrs.get("title") or "").strip()
+                body = (attrs.get("body") or "").strip()
+                text = (title or body).replace("\n", " ")[:120]
+                if not text:
+                    continue
+                stars = "⭐⭐⭐⭐⭐" if rating == 5 else "⭐"
+                nick = (attrs.get("reviewerNickname") or "user").strip()
+                flag = self._flag(attrs.get("territory"))
+                pings.append(f"{stars} {name} — “{text}” — {nick} {flag}".strip())
+        if pings:
+            for chat_id in self.chat_ids:
+                for chunk in self._chunks("\n".join(pings)):
+                    self.send(chunk, chat_id=chat_id)
+            log(f"review pings: {len(pings)}")
+
     # ------------------------------------------------------------------ loop
+
 
     def _tick_revenue(self):
         """Poll RC's realtime revenue metric and ping on new revenue/refunds.
@@ -530,7 +791,11 @@ class StoreBot:
                 dirty = True
                 continue
             delta = v - b["value"]
-            if delta > 0.004:
+            suppress = (self.state.get("hook_suppress") or {}).get(p["name"], 0)
+            if suppress > time.time():
+                b["value"] = v
+                dirty = True
+            elif delta > 0.004:
                 pings.append(self._celebrate(p["name"], delta))
                 b["value"] = v
                 dirty = True
@@ -564,8 +829,12 @@ class StoreBot:
             self._drain_backlog()
         log("storebot online")
         while True:
-            self._tick_appstore()
-            self._tick_revenue()
+            for tick in (self._tick_hook, self._tick_revenue,
+                         self._tick_appstore, self._tick_reviews):
+                try:
+                    tick()
+                except Exception as e:
+                    log(f"{tick.__name__}: {e}", "ERROR")
             try:
                 updates = self.tg_api("getUpdates", {
                     "offset": self.state.get("update_offset", 0), "timeout": 25,
@@ -701,6 +970,16 @@ class StoreBot:
             yesterday = date.today() - timedelta(days=1)
             return f"{p['name']} proceeds {yesterday}: {self.rc_revenue(p, yesterday, yesterday)}"
         check("revenuecat revenue range", _rev)
+
+        def _hook():
+            if not self.hook_url:
+                return "not configured"
+            r = requests.get(f"{self.hook_url}/events", timeout=30,
+                             headers={"X-Hook-Secret": self.hook_secret})
+            r.raise_for_status()
+            n = len((r.json() or {}).get("events") or [])
+            return f"relay ok, {n} queued events"
+        check("webhook relay", _hook)
 
         print("SELFTEST " + ("PASS" if ok else "FAIL"))
         return 0 if ok else 1
