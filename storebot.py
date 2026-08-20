@@ -1,37 +1,26 @@
 #!/usr/bin/env python3
-"""storebot — Telegram bot pinging Midgar's App Store + RevenueCat revenue.
+"""storebot — Telegram bot that tells Marcus the moment a sale lands.
 
-Long-polls a dedicated Telegram bot. Core feature: a revenue watcher that polls
-RevenueCat's realtime revenue metric (default every 60s) and celebrates the
-moment a project earns money (refunds are tracked silently):
+Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
 
-  ☀️ Solar Beam: +$6.00
-  🎊 Today crossed $10
+  - RevenueCat sales (IAP, subscriptions): polls the realtime revenue metric
+    every ~60s per project and pings on any increase, emoji + amount:
 
-Emoji are randomized per app and amount tier; daily revenue milestones fire
-once each.
+      ☀️ Solar Beam: +$6.00
 
-Plus on-demand commands and one lean daily digest (default 09:00 local):
+  - Paid-app sales (invisible to RevenueCat, e.g. SForesight): checks the App
+    Store sales report once a day (default 09:00) and pings only when a paid
+    app download actually landed:
 
-  /sales [n|week|month|date]   App Store downloads + proceeds (default: yesterday)
-  /countries [date]            top download countries for a single day
-  /revenue [range] [type]      RevenueCat revenue for a range (proceeds|gross|net)
-  /mrr                         active subscriptions, trials, MRR, 28d revenue
-  /apps                        one-line snapshot per tracked app
-  /digest                      send the daily digest now
-  /status                      health, uptime, next digest
-  /on  /off                    toggle alerts (revenue pings + daily digest)
+      📦 SForesight: +$9.99 USD
 
-Data sources: App Store Connect salesReports (SALES/SUMMARY per day, gzip TSV,
-ES256 JWT signed locally) and the RevenueCat v2 API. Every RC_SECRET_* key in
-the Midgar credentials vault is discovered via /v2/projects (name + id), then
-queried via /metrics/overview and /metrics/revenue — new RC projects are picked
-up automatically when a key is added to credentials.env.
+Refunds are tracked silently. Daily revenue milestones (once each) ride along
+with the pings. Control commands: /status, /on, /off, /help.
 
 Config (both files parsed by the bot itself; sourceable `export KEY=value` and
 plain KEY=value lines accepted):
   ~/.config/storebot/secrets.env   STOREBOT_TOKEN, STOREBOT_CHAT_IDS,
-                                   STOREBOT_DIGEST_HOUR (default 9),
+                                   STOREBOT_DIGEST_HOUR (default 9, App Store check hour),
                                    STOREBOT_POLL_SECONDS (default 60),
                                    STOREBOT_VENDOR (ASC vendor number),
                                    STOREBOT_API_BASE (default https://api.telegram.org)
@@ -40,7 +29,6 @@ plain KEY=value lines accepted):
 
 CLI:
   --selftest     validate the data layer (ASC + RevenueCat) and exit
-  --digest-now   send the daily digest and exit
   --replay       walk every project's purchase + renewal history and send the
                  real revenue events as celebratory lines (one-off, ~10 min)
   --send TEXT    send one raw message and exit
@@ -205,7 +193,6 @@ class StoreBot:
         self._jwt_exp = 0.0
         self._rc_projects = None
         self._last_poll = 0.0
-        self.last_status = {"asc": "", "rc": ""}
 
     def run(self):
         if "--selftest" in sys.argv:
@@ -217,9 +204,6 @@ class StoreBot:
             text = sys.argv[sys.argv.index("--send") + 1]
             self.send(text)
             print("sent")
-            return 0
-        if "--digest-now" in sys.argv:
-            self._send_digest()
             return 0
         if "--replay" in sys.argv:
             self._replay()
@@ -325,54 +309,6 @@ class StoreBot:
                                   delimiter="\t"):
             rows.append(row)
         return rows
-
-    @staticmethod
-    def aggregate(rows):
-        apps = {}
-        for row in rows:
-            title = row.get("Title", "").strip() or "?"
-            units = int(row.get("Units") or 0)
-            currency = (row.get("Currency of Proceeds") or "").strip()
-            try:
-                proceeds = float(row.get("Developer Proceeds") or 0)
-            except ValueError:
-                proceeds = 0.0
-            a = apps.setdefault(title, {"units": 0, "proceeds": {}, "countries": Counter()})
-            a["units"] += units
-            if currency and proceeds:
-                a["proceeds"][currency] = round(a["proceeds"].get(currency, 0) + proceeds, 2)
-            country = (row.get("Country Code") or "").strip()
-            if country:
-                a["countries"][country] += units
-        return apps
-
-    def sales_span(self, days):
-        """Aggregate downloads into per-app totals plus a per-day units list.
-
-        Days without a report count as zero. `days <= 0` means today only."""
-        today = date.today()
-        if days <= 0:
-            days = 1
-            end = today
-        else:
-            end = today - timedelta(days=1)
-        merged = {}
-        per_day = []
-        for i in range(days):
-            day = end - timedelta(days=days - 1 - i)
-            rows = self.asc_sales(day)
-            units = sum(int(r.get("Units") or 0) for r in rows) if rows else 0
-            per_day.append((day, units))
-            if rows:
-                for title, a in self.aggregate(rows).items():
-                    m = merged.setdefault(title, {"units": 0, "proceeds": {}, "countries": Counter()})
-                    m["units"] += a["units"]
-                    for cur, val in a["proceeds"].items():
-                        m["proceeds"][cur] = round(m["proceeds"].get(cur, 0) + val, 2)
-                    m["countries"].update(a["countries"])
-        return merged, per_day
-
-    # -------------------------------------------------------------------- rc
 
     def rc_get(self, secret, path, params=None, timeout=45):
         url = path if path.startswith("http") else RC_BASE + path
@@ -521,10 +457,6 @@ class StoreBot:
             if not events:
                 log(f"history {p['name']}: no events")
                 continue
-            first = datetime.fromtimestamp(events[0][0] / 1000)
-            last = datetime.fromtimestamp(events[-1][0] / 1000)
-            header = (f"📜 {p['name']} — {len(events)} events · "
-                      f"{first.strftime('%b %d')} → {last.strftime('%b %d')}")
             lines = []
             for ts, rev, product in events:
                 label = p["name"]
@@ -533,7 +465,7 @@ class StoreBot:
                 elif product:
                     label = f"{p['name']} · {product[:24]}"
                 lines.append(self._celebrate(label, rev))
-            for chunk in self._chunks("\n".join([header, *lines])):
+            for chunk in self._chunks("\n".join(lines)):
                 for chat_id in self.chat_ids:
                     self.send(chunk, chat_id=chat_id)
             log(f"history {p['name']}: sent {len(events)} events")
@@ -544,9 +476,6 @@ class StoreBot:
     def _fmt_money(v):
         return f"${v:,.2f}"
 
-    @staticmethod
-    def _units(n):
-        return f"{n} unit" if n == 1 else f"{n} units"
 
     def _celebrate(self, name, delta):
         """One-line celebration for a revenue bump: per-app emoji, else a
@@ -563,223 +492,14 @@ class StoreBot:
     def _projects_ok(self):
         return [p for p in self.rc_projects() if "project_id" in p]
 
-    def _sales_text(self, days):
-        merged, per_day = self.sales_span(days)
-        today = date.today()
-        if days <= 0:
-            day = today
-            if not merged:
-                return (f"📥 App Store — {day.strftime('%a %Y-%m-%d')}\n"
-                        f"No sales reported for today yet (report is generated next day).")
-            lines = self._apps_lines(merged, show_units=True)
-            head = f"📥 App Store — {day.strftime('%a %Y-%m-%d')} (partial)"
-            total_units = sum(a["units"] for a in merged.values())
-            tail = self._proceeds_tail(merged)
-            return "\n".join([head, f"Total: {self._units(total_units)}" + tail, "", *lines])
-        if days == 1:
-            day = today - timedelta(days=1)
-            if not merged:
-                return (f"📥 App Store — {day.strftime('%a %Y-%m-%d')}\n"
-                        f"No sales reported for this date (yet).")
-            lines = self._apps_lines(merged, show_units=True)
-            head = f"📥 App Store — {day.strftime('%a %Y-%m-%d')}"
-            total_units = sum(a["units"] for a in merged.values())
-            tail = self._proceeds_tail(merged)
-            return "\n".join([head, f"Total: {self._units(total_units)}" + tail, "", *lines])
-        if not merged and not sum(u for _, u in per_day):
-            return "📥 App Store — no sales in the selected range."
-        start = today - timedelta(days=days)
-        end = today - timedelta(days=1)
-        total_units = sum(a["units"] for a in merged.values())
-        trend = "  ".join(f"{d.strftime('%d')}:{u}" for d, u in per_day)
-        lines = self._apps_lines(merged, show_units=True)
-        tail = self._proceeds_tail(merged)
-        return "\n".join([
-            f"📥 App Store — {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}",
-            f"Total: {self._units(total_units)}" + tail,
-            f"Per day: {trend}", "", *lines,
-        ])
-
-    @staticmethod
-    def _apps_lines(merged, show_units=True, limit=15):
-        ranked = sorted(merged.items(), key=lambda kv: kv[1]["units"], reverse=True)[:limit]
-        return [f"{i + 1}. {title} — {self._units(a['units'])}" for i, (title, a) in enumerate(ranked)]
-
-    @staticmethod
-    def _proceeds_tail(merged):
-        totals = Counter()
-        for a in merged.values():
-            for cur, val in a["proceeds"].items():
-                totals[cur] = round(totals[cur] + val, 2)
-        if not totals:
-            return ""
-        parts = " + ".join(f"{val:,.2f} {cur}" for cur, val in sorted(totals.items()))
-        return f" · Proceeds: {parts}"
-
-    def _countries_text(self, day):
-        rows = self.asc_sales(day)
-        if not rows:
-            return f"🌍 No sales reported for {day} yet."
-        merged = self.aggregate(rows)
-        countries = Counter()
-        for a in merged.values():
-            countries.update(a["countries"])
-        top = countries.most_common(12)
-        lines = [f"{i + 1}. {code} — {units}" for i, (code, units) in enumerate(top)]
-        return "\n".join([f"🌍 Top countries — {day} ({countries.total()} units total)", *lines])
-
-    def _revenue_text(self, days, revenue_type, label):
-        start = date.today() - timedelta(days=days)
-        end = date.today() - timedelta(days=1)
-        lines, total = [], 0.0
-        errors = []
-        for p in self._projects_ok():
-            v = self.rc_revenue(p, start, end, revenue_type)
-            if v is None:
-                errors.append(p["name"])
-                continue
-            total += v
-            if v:
-                lines.append(f"{p['name']} — {self._fmt_money(v)}")
-        if not lines:
-            lines.append("$0.00 across all projects")
-        if errors:
-            lines.append(f"⚠️ no data: {', '.join(errors)}")
-        return "\n".join([
-            f"💰 RevenueCat {label} — {start} → {end}",
-            f"Total: {self._fmt_money(total)}",
-            "", *lines,
-        ])
-
-    def _mrr_text(self):
-        lines, errors = [], []
-        active = trials = mrr = rev28 = new_customers = 0
-        for p in self._projects_ok():
-            m = self.rc_metrics(p)
-            if m is None:
-                errors.append(p["name"])
-                continue
-            active += m.get("active_subscriptions", 0)
-            trials += m.get("active_trials", 0)
-            mrr += m.get("mrr", 0)
-            rev28 += m.get("revenue", 0)
-            new_customers += m.get("new_customers", 0)
-            lines.append(f"{p['name']} — {int(m.get('active_subscriptions', 0))} active"
-                         f" · {self._fmt_money(m.get('mrr', 0))}")
-        head = "\n".join([
-            "📈 Subscriptions (now)",
-            f"Active: {int(active)} · Trials: {int(trials)} · MRR: {self._fmt_money(mrr)}",
-            f"28d revenue: {self._fmt_money(rev28)} · 28d new customers: {int(new_customers)}",
-        ])
-        if errors:
-            head += f"\n⚠️ no data: {', '.join(errors)}"
-        return "\n".join([head, "", *lines])
-
-    def _apps_text(self):
-        lines, errors = [], []
-        for p in self._projects_ok():
-            m = self.rc_metrics(p)
-            if m is None:
-                errors.append(p["name"])
-                continue
-            lines.append(f"{p['name']} — {int(m.get('active_subscriptions', 0))} active"
-                         f" · {self._fmt_money(m.get('mrr', 0))}"
-                         f" · {int(m.get('active_trials', 0))} trials")
-        if errors:
-            lines.append(f"⚠️ no data: {', '.join(errors)}")
-        return "\n".join(["🗂 Apps", *lines])
-
-    def _digest_text(self):
-        yesterday = date.today() - timedelta(days=1)
-        merged, _ = self.sales_span(1)
-        units = sum(a["units"] for a in merged.values())
-        top = sorted(merged.items(), key=lambda kv: kv[1]["units"], reverse=True)[:3]
-        top_line = " · ".join(f"{t} {a['units']}" for t, a in top) or "—"
-
-        rc_total = 0.0
-        active = trials = mrr = rev28 = 0
-        errors = []
-        for p in self._projects_ok():
-            m = self.rc_metrics(p)
-            if m is None:
-                errors.append(p["name"])
-                continue
-            v = self.rc_revenue(p, yesterday, yesterday, "proceeds")
-            if v is not None:
-                rc_total += v
-            active += m.get("active_subscriptions", 0)
-            trials += m.get("active_trials", 0)
-            mrr += m.get("mrr", 0)
-            rev28 += m.get("revenue", 0)
-        parts = [
-            f"📊 {date.today().strftime('%a %Y-%m-%d')}",
-            f"📥 {self._units(units)} downloads yesterday ({top_line})",
-            f"💰 {self._fmt_money(rc_total)} revenue yesterday",
-            f"📈 {int(active)} active · {int(trials)} trials · MRR {self._fmt_money(mrr)} · 28d {self._fmt_money(rev28)}",
-        ]
-        delta = self._delta_line(active, mrr)
-        if delta:
-            parts.append(delta)
-        if errors:
-            parts.append(f"⚠️ no data: {', '.join(errors)}")
-        return "\n".join(parts)
-
-    def _delta_line(self, active, mrr):
-        snaps = self.state.get("snapshots") or {}
-        prev = sorted((d for d in snaps if d != date.today().isoformat()), reverse=True)
-        if not prev:
-            return ""
-        snap = snaps[prev[0]]
-        prev_active = sum(s.get("active", 0) for s in snap.values())
-        prev_mrr = sum(s.get("mrr", 0) for s in snap.values())
-        d_active = int(active) - int(prev_active)
-        d_mrr = mrr - prev_mrr
-        bits = []
-        if d_active:
-            bits.append(f"active {'+' if d_active > 0 else ''}{d_active}")
-        if abs(d_mrr) >= 0.005:
-            bits.append(f"MRR {'+' if d_mrr > 0 else ''}{self._fmt_money(d_mrr)}")
-        if not bits:
-            return f"Δ vs {prev[0]}: no change"
-        return f"Δ vs {prev[0]}: " + " · ".join(bits)
-
-    def _snapshot_now(self):
-        snap = {}
-        for p in self._projects_ok():
-            m = self.rc_metrics(p)
-            if m is None:
-                continue
-            snap[p["name"]] = {"active": m.get("active_subscriptions", 0), "mrr": m.get("mrr", 0)}
-        snaps = self.state.get("snapshots") or {}
-        snaps[date.today().isoformat()] = snap
-        for old in sorted(snaps)[:-14]:
-            del snaps[old]
-        self.state["snapshots"] = snaps
-
     def _status_text(self):
         up = time.time() - self.started
-        d = datetime.now()
         enabled = self.state.get("alerts_enabled", True)
-        last = self.state.get("last_digest") or "never"
-        today = date.today().isoformat()
-        if last == today:
-            nxt = f"tomorrow {self.digest_hour:02d}:00"
-        elif d.hour < self.digest_hour:
-            nxt = f"today {self.digest_hour:02d}:00"
-        else:
-            nxt = "due now"
-        if not enabled:
-            nxt = "off"
-        lines = [
+        return "\n".join([
             f"🟢 storebot up {int(up // 3600)}h{int(up % 3600 // 60):02d}m · alerts {'ON' if enabled else 'OFF'}",
-            f"Revenue pings every {self.poll_seconds}s · Digest: {last} / next {nxt}",
-            f"ASC vendor {self.vendor} · RC projects: {len(self._projects_ok())}",
-        ]
-        if self.last_status["asc"]:
-            lines.append(f"ASC: {self.last_status['asc']}")
-        if self.last_status["rc"]:
-            lines.append(f"RC: {self.last_status['rc']}")
-        return "\n".join(lines)
+            f"Revenue pings every {self.poll_seconds}s · App Store check daily {self.digest_hour:02d}:00",
+            f"RC projects: {len(self._projects_ok())}",
+        ])
 
     # ------------------------------------------------------------------ loop
 
@@ -844,7 +564,7 @@ class StoreBot:
             self._drain_backlog()
         log("storebot online")
         while True:
-            self._tick_digest()
+            self._tick_appstore()
             self._tick_revenue()
             try:
                 updates = self.tg_api("getUpdates", {
@@ -871,6 +591,43 @@ class StoreBot:
                     except RuntimeError:
                         pass
 
+    def _tick_appstore(self):
+        """Daily check for paid-app sales (invisible to RevenueCat) — pings
+        only when a paid download actually landed yesterday."""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        if not self.state.get("alerts_enabled", True) or self.state.get("last_as_check") == today:
+            return
+        if now.hour < self.digest_hour or now.hour >= self.digest_hour + 2:
+            return
+        try:
+            rows = self.asc_sales(date.today() - timedelta(days=1))
+        except requests.RequestException as e:
+            log(f"appstore check failed: {e}", "WARN")
+            self.state["last_as_check"] = today
+            save_state(self.state)
+            return
+        pings = []
+        for row in rows or []:
+            if not re.match(r"^F?[137][EUP]?$", (row.get("Product Type Identifier") or "").strip()):
+                continue
+            try:
+                proceeds = float(row.get("Developer Proceeds") or 0)
+            except ValueError:
+                proceeds = 0.0
+            if proceeds <= 0:
+                continue
+            title = (row.get("Title") or "").strip()
+            cur = (row.get("Currency of Proceeds") or "").strip() or "$"
+            pings.append(f"📦 {title}: +{proceeds:,.2f} {cur}")
+        self.state["last_as_check"] = today
+        save_state(self.state)
+        if pings:
+            text = "\n".join(pings)
+            for chat_id in self.chat_ids:
+                self.send(text, chat_id=chat_id)
+            log(f"appstore ping: {'; '.join(pings)}")
+
     def _drain_backlog(self):
         try:
             updates = self.tg_api("getUpdates", {"offset": -1, "timeout": 0}, timeout=15) or []
@@ -880,115 +637,25 @@ class StoreBot:
             self.state["update_offset"] = 0
         save_state(self.state)
 
-    def _tick_digest(self):
-        now = datetime.now()
-        today = now.strftime("%Y-%m-%d")
-        if not self.state.get("alerts_enabled", True):
-            return
-        if self.state.get("last_digest") == today:
-            return
-        retry_at = self.state.get("digest_retry_at", 0)
-        if now.hour < self.digest_hour or time.time() < retry_at:
-            return
-        if now.hour >= self.digest_hour + 2:
-            self.state["last_digest"] = today
-            save_state(self.state)
-            return
-        try:
-            self._send_digest()
-            self.state["last_digest"] = today
-            self.state.pop("digest_retry_at", None)
-            save_state(self.state)
-        except Exception as e:
-            log(f"digest failed, retrying in 30min: {e}", "ERROR")
-            self.state["digest_retry_at"] = time.time() + 1800
-            save_state(self.state)
-
-    def _send_digest(self):
-        text = self._digest_text()
-        self._snapshot_now()
-        for chat_id in self.chat_ids:
-            self.send(text, chat_id=chat_id)
-        self.state["last_digest"] = date.today().isoformat()
-        save_state(self.state)
-        self.last_status["rc"] = "digest sent"
-        log("digest sent")
-
-    # --------------------------------------------------------------- handlers
-
     def handle(self, text):
         cmd, _, rest = text.partition(" ")
         cmd = cmd.split("@")[0].lower()
-        rest = rest.strip()
         if cmd in ("/help", "/start"):
             self.send("Commands:\n" + "\n".join(f"/{c} — {d}" for c, d in COMMANDS))
-        elif cmd == "/sales":
-            self.send(self._sales_text(self._parse_days(rest)))
-        elif cmd == "/countries":
-            day = self._parse_date(rest)
-            self.send(self._countries_text(day))
-        elif cmd == "/revenue":
-            days, api_type, label = self._parse_revenue(rest)
-            self.send(self._revenue_text(days, api_type, label))
-        elif cmd == "/mrr":
-            self.send(self._mrr_text())
-        elif cmd == "/apps":
-            self.send(self._apps_text())
-        elif cmd == "/digest":
-            self.send("⏳ building digest…")
-            self._send_digest()
         elif cmd == "/status":
             self.send(self._status_text())
         elif cmd == "/on":
             self.state["alerts_enabled"] = True
             save_state(self.state)
-            self.send(f"Alerts ON — revenue pings live, digest at {self.digest_hour:02d}:00 daily.")
+            self.send("Alerts ON.")
         elif cmd == "/off":
             self.state["alerts_enabled"] = False
             save_state(self.state)
-            self.send("Alerts OFF (revenue pings + daily digest). /on to re-enable.")
+            self.send("Alerts OFF. /on to re-enable.")
         elif cmd.startswith("/"):
             self.send("Unknown command. /help")
         else:
             self.send("Use /help for commands.")
-
-    def _parse_days(self, rest):
-        today = date.today()
-        if not rest:
-            return 1
-        arg = rest.lower()
-        if arg == "week":
-            return 7
-        if arg == "month":
-            return 30
-        if arg == "today":
-            return 0
-        if arg.isdigit():
-            return max(1, min(int(arg), 90))
-        m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", arg)
-        if m:
-            d = date(*map(int, m.groups()))
-            return max(0, (today - d).days)
-        return 1
-
-    def _parse_date(self, rest):
-        m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", rest)
-        if m:
-            return date(*map(int, m.groups()))
-        return date.today() - timedelta(days=1)
-
-    def _parse_revenue(self, rest):
-        aliases = {"proceeds": ("proceeds", "proceeds"),
-                   "gross": ("revenue", "gross revenue"),
-                   "net": ("revenue_net_of_taxes", "net of taxes")}
-        parts = rest.split()
-        days = self._parse_days(parts[0]) if parts else 1
-        api_type, label = aliases["proceeds"]
-        if len(parts) > 1 and parts[-1] in aliases:
-            api_type, label = aliases[parts[-1]]
-        return days, api_type, label
-
-    # --------------------------------------------------------------- selftest
 
     def selftest(self):
         ok = True
@@ -1040,14 +707,8 @@ class StoreBot:
 
 
 COMMANDS = [
-    ("sales", "App Store downloads & proceeds"),
-    ("countries", "top download countries for a day"),
-    ("revenue", "RevenueCat revenue for a range (proceeds default)"),
-    ("mrr", "active subs, trials, MRR, 28d revenue"),
-    ("apps", "per-app subscription snapshot"),
-    ("digest", "send the daily digest now"),
     ("status", "bot health"),
-    ("on", "enable alerts (revenue pings + digest)"),
+    ("on", "enable alerts"),
     ("off", "disable alerts"),
     ("help", "list commands"),
 ]
