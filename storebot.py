@@ -16,9 +16,12 @@ Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
     when a project has no webhook or the relay is down) and suppresses itself
     around webhook deliveries so nothing double-pings.
 
-  - Paid-app sales (invisible to RevenueCat, e.g. SForesight): checks the App
-    Store sales report once a day (default 09:00) and pings only when a paid
-    app download actually landed.
+  - Everything else Apple-side (paid-app downloads, invisible to RevenueCat,
+    plus one-time IAPs / subscriptions of apps with no RC project): checks
+    the App Store SALES report once a day (default 09:00) and pings every
+    revenue row. Rows for RC-covered apps are suppressed so nothing
+    double-pings. Apple publishes DAILY reports with ~1 day lag and retries
+    until the report lands, so these pings arrive next morning.
 
   - App reviews: polls App Store Connect customerReviews and pings new 5★ and
     1★ reviews (default every 30 min).
@@ -538,6 +541,59 @@ class StoreBot:
     def _projects_ok(self):
         return [p for p in self.rc_projects() if "project_id" in p]
 
+    def _ensure_apps(self):
+        """Refresh the cached ASC apps list daily (shared by reviews + sales)."""
+        if self._apps_cache is None or time.time() - self._apps_cache["at"] > 86400:
+            data = self.asc_get("/v1/apps?limit=200")
+            self._apps_cache = {"at": time.time(), "apps": data.get("data") or []}
+
+    def _is_rc_covered(self, app_title):
+        """True when an ASC app title belongs to a RevenueCat-watched project
+        (its IAP/sub rows are already pinged live by the webhook path)."""
+        t = re.sub(r"[^a-z0-9]+", "", (app_title or "").lower())
+        m = re.match(r"[a-z0-9]+", t)
+        first = m.group(0) if m else ""
+        for p in self._projects_ok():
+            pn = re.sub(r"[^a-z0-9]+", "", p["name"].lower())
+            pm = re.match(r"[a-z0-9]+", pn)
+            pfirst = pm.group(0) if pm else ""
+            if (pn and pn in t) or (t and t in pn) or (len(first) >= 4 and first == pfirst):
+                return True
+        return False
+
+    def _asc_money_pings(self, rows):
+        """Ping lines for every revenue row in a SALES report that storebot's
+        RevenueCat path cannot see: all paid-app downloads plus IAP/subscription
+        rows of apps without an RC project. IAP rows are attributed to their
+        app via Parent Identifier (the app's SKU)."""
+        sku_map = {}
+        for a in self._apps_cache["apps"]:
+            attr = a["attributes"]
+            for key in (attr.get("sku"), attr.get("bundleId")):
+                if key:
+                    sku_map[key] = attr.get("name", "?")
+        pings = set()
+        for row in rows:
+            try:
+                proceeds = float(row.get("Developer Proceeds") or 0)
+            except ValueError:
+                continue
+            if proceeds <= 0:
+                continue
+            title = (row.get("Title") or "").strip()
+            ptype = (row.get("Product Type Identifier") or "").strip()
+            parent = (row.get("Parent Identifier") or "").strip()
+            app_name = sku_map.get(parent) if parent else None
+            is_iap = app_name is not None or ptype.startswith("IA")
+            app_name = app_name or title
+            if is_iap and self._is_rc_covered(app_name):
+                continue
+            label = f"{app_name} · {title}" if is_iap and title != app_name else app_name
+            flag = self._flag(row.get("Country Code"))
+            cur = (row.get("Currency of Proceeds") or "").strip() or "$"
+            pings.add(f"📦 {label}: +{proceeds:,.2f} {cur}" + (f" {flag}" if flag else ""))
+        return sorted(pings)
+
     def _status_text(self):
         up = time.time() - self.started
         enabled = self.state.get("alerts_enabled", True)
@@ -713,9 +769,7 @@ class StoreBot:
         if not self.state.get("alerts_enabled", True):
             return
         try:
-            if self._apps_cache is None or time.time() - self._apps_cache["at"] > 86400:
-                data = self.asc_get("/v1/apps?limit=200")
-                self._apps_cache = {"at": time.time(), "apps": data.get("data") or []}
+            self._ensure_apps()
         except requests.RequestException as e:
             log(f"apps list: {e}", "WARN")
             return
@@ -861,34 +915,29 @@ class StoreBot:
                         pass
 
     def _tick_appstore(self):
-        """Daily check for paid-app sales (invisible to RevenueCat) — pings
-        only when a paid download actually landed yesterday."""
+        """Daily sweep of Apple's SALES report — catches every revenue row the
+        RevenueCat path can't see (paid downloads + IAPs/subs of apps without
+        an RC project). Apple publishes DAILY reports with ~1 day lag, so this
+        retries through the digest window until the report lands; RC-covered
+        apps are suppressed so a sale never pings twice."""
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         if not self.state.get("alerts_enabled", True) or self.state.get("last_as_check") == today:
             return
-        if now.hour < self.digest_hour or now.hour >= self.digest_hour + 2:
+        if now.hour < self.digest_hour or now.hour >= self.digest_hour + 6:
             return
+        if time.time() - getattr(self, "_last_as_try", 0.0) < 600:
+            return
+        self._last_as_try = time.time()
         try:
             rows = self.asc_sales(date.today() - timedelta(days=1))
+            if rows is None:
+                return
+            self._ensure_apps()
         except requests.RequestException as e:
             log(f"appstore check failed: {e}", "WARN")
-            self.state["last_as_check"] = today
-            save_state(self.state)
             return
-        pings = []
-        for row in rows or []:
-            if not re.match(r"^F?[137][EUP]?$", (row.get("Product Type Identifier") or "").strip()):
-                continue
-            try:
-                proceeds = float(row.get("Developer Proceeds") or 0)
-            except ValueError:
-                proceeds = 0.0
-            if proceeds <= 0:
-                continue
-            title = (row.get("Title") or "").strip()
-            cur = (row.get("Currency of Proceeds") or "").strip() or "$"
-            pings.append(f"📦 {title}: +{proceeds:,.2f} {cur}")
+        pings = self._asc_money_pings(rows)
         self.state["last_as_check"] = today
         save_state(self.state)
         if pings:
