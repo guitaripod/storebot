@@ -917,14 +917,12 @@ class StoreBot:
     def _tick_appstore(self):
         """Daily sweep of Apple's SALES report — catches every revenue row the
         RevenueCat path can't see (paid downloads + IAPs/subs of apps without
-        an RC project). Apple publishes DAILY reports with ~1 day lag, so this
-        retries through the digest window until the report lands; RC-covered
+        an RC project). Apple publishes DAILY reports with ~1 day lag and an
+        unpredictable hour, so it retries every 10 min all day; RC-covered
         apps are suppressed so a sale never pings twice."""
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         if not self.state.get("alerts_enabled", True) or self.state.get("last_as_check") == today:
-            return
-        if now.hour < self.digest_hour or now.hour >= self.digest_hour + 6:
             return
         if time.time() - getattr(self, "_last_as_try", 0.0) < 600:
             return
@@ -932,6 +930,7 @@ class StoreBot:
         try:
             rows = self.asc_sales(date.today() - timedelta(days=1))
             if rows is None:
+                log("appstore: yesterday's SALES report not published yet, will retry")
                 return
             self._ensure_apps()
         except requests.RequestException as e:
