@@ -542,10 +542,17 @@ class StoreBot:
     def _projects_ok(self):
         return [p for p in self.rc_projects() if "project_id" in p]
 
+    APP_FIELDS = ("name,bundleId,sku,subscriptionStatusUrl,subscriptionStatusUrlVersion,"
+                  "subscriptionStatusUrlForSandbox,subscriptionStatusUrlVersionForSandbox")
+
     def _ensure_apps(self):
-        """Refresh the cached ASC apps list daily (shared by reviews + sales)."""
+        """Refresh the cached ASC apps list daily (shared by reviews + sales).
+
+        The notification URLs are not in the default field set and have to be
+        asked for by name, so a plain list silently reports every app as having
+        none."""
         if self._apps_cache is None or time.time() - self._apps_cache["at"] > 86400:
-            data = self.asc_get("/v1/apps?limit=200")
+            data = self.asc_get(f"/v1/apps?limit=200&fields[apps]={self.APP_FIELDS}")
             self._apps_cache = {"at": time.time(), "apps": data.get("data") or []}
 
     @staticmethod
@@ -586,11 +593,24 @@ class StoreBot:
                 return True
         return False
 
+    def _notifies_storebot(self, app):
+        """True when an app's App Store Server Notification URL points at the
+        relay, which is what makes its purchases arrive live."""
+        target = f"{self.hook_url}/asn"
+        attr = app.get("attributes") or {}
+        url = attr.get("subscriptionStatusUrl") or ""
+        return bool(self.hook_url) and url.startswith(target)
+
     def _is_live_covered(self, app_title):
         """True when an app's IAP rows already ping the moment they happen —
         through RevenueCat, or through Apple's own server notifications."""
-        return (self._is_rc_covered(app_title)
-                or app_title in self.state.get("asn_apps", {}))
+        if self._is_rc_covered(app_title) or app_title in self.state.get("asn_apps", {}):
+            return True
+        for app in (self._apps_cache or {}).get("apps") or []:
+            if (app["attributes"].get("name") == app_title
+                    and self._notifies_storebot(app)):
+                return True
+        return False
 
     def _asc_money_pings(self, rows):
         """Ping lines for every revenue row in a SALES report that storebot's
