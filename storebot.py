@@ -236,6 +236,7 @@ class StoreBot:
         self._products_cache = {}
         self._apps_cache = None
         self._ever_sold_seeded = False
+        self._last_coverage = 0.0
 
     def run(self):
         if "--selftest" in sys.argv:
@@ -547,17 +548,37 @@ class StoreBot:
             data = self.asc_get("/v1/apps?limit=200")
             self._apps_cache = {"at": time.time(), "apps": data.get("data") or []}
 
+    @staticmethod
+    def _name_key(name):
+        """A name reduced to its letters and digits, for containment tests."""
+        return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+    @staticmethod
+    def _brand(name):
+        """The leading word of an app or project name — the part the two sides
+        still share when a store title and its RevenueCat project are worded
+        differently ("Helia: UV Index" against "Helia: Solar Coach")."""
+        m = re.search(r"[a-z0-9]+", (name or "").lower())
+        return m.group(0) if m else ""
+
+    def _ambiguous_brands(self):
+        """Leading words carried by more than one App Store app, which are too
+        weak to attribute a RevenueCat project by."""
+        counts = Counter(self._brand(a["attributes"].get("name", ""))
+                         for a in (self._apps_cache or {}).get("apps") or [])
+        return {b for b, n in counts.items() if b and n > 1}
+
     def _is_rc_covered(self, app_title):
         """True when an ASC app title belongs to a RevenueCat-watched project
         (its IAP/sub rows are already pinged live by the webhook path)."""
-        t = re.sub(r"[^a-z0-9]+", "", (app_title or "").lower())
-        m = re.match(r"[a-z0-9]+", t)
-        first = m.group(0) if m else ""
+        t = self._name_key(app_title)
+        brand = self._brand(app_title)
+        weak = self._ambiguous_brands()
         for p in self._projects_ok():
-            pn = re.sub(r"[^a-z0-9]+", "", p["name"].lower())
-            pm = re.match(r"[a-z0-9]+", pn)
-            pfirst = pm.group(0) if pm else ""
-            if (pn and pn in t) or (t and t in pn) or (len(first) >= 4 and first == pfirst):
+            pn = self._name_key(p["name"])
+            if (pn and pn in t) or (t and t in pn):
+                return True
+            if len(brand) >= 4 and brand not in weak and brand == self._brand(p["name"]):
                 return True
         return False
 
@@ -733,6 +754,7 @@ class StoreBot:
                 event = json.loads(entry.get("payload") or "{}")
             except (json.JSONDecodeError, TypeError):
                 continue
+            self.state.setdefault("hook_seen", {})[project["name"]] = time.time()
             line = self._hook_line(project, event)
             if line:
                 pings.append(line)
@@ -874,6 +896,73 @@ class StoreBot:
                 self.send(text, chat_id=chat_id)
             log(f"revenue ping: {'; '.join(pings)}")
 
+    def _app_monetizes(self, app_id):
+        """True when an ASC app has any in-app purchase or subscription group,
+        i.e. it can earn money that RevenueCat would be the one to report."""
+        for path in (f"/v1/apps/{app_id}/inAppPurchasesV2?limit=1",
+                     f"/v1/apps/{app_id}/subscriptionGroups?limit=1"):
+            try:
+                if self.asc_get(path).get("data"):
+                    return True
+            except requests.RequestException as e:
+                log(f"coverage iap {app_id}: {e}", "WARN")
+        return False
+
+    def _coverage_gaps(self):
+        """(apps that can take money but have no RC project, RC projects that
+        earn but have never delivered a webhook) — every sale that would land
+        late or not at all."""
+        self._ensure_apps()
+        unwired = []
+        for app in self._apps_cache["apps"]:
+            name = app["attributes"].get("name", "?")
+            if self._is_rc_covered(name):
+                continue
+            if self._app_monetizes(app["id"]):
+                unwired.append(name)
+        proven = set(self.state.get("hook_seen", {})) | set(self.state.get("hook_suppress", {}))
+        silent = []
+        for p in self._projects_ok():
+            if p["name"] in proven:
+                continue
+            m = self.rc_metrics(p)
+            if m and m.get("revenue", 0) > 0:
+                silent.append(p["name"])
+        return sorted(unwired), sorted(silent)
+
+    def _coverage_text(self, unwired, silent):
+        if not unwired and not silent:
+            return "\u2705 every earning app is wired to the webhook path."
+        lines = ["\u26a0\ufe0f sales that will not ping live:"]
+        if unwired:
+            lines.append("no RC project: " + ", ".join(unwired))
+        if silent:
+            lines.append("RC webhook never delivered: " + ", ".join(silent))
+        return "\n".join(lines)
+
+    def _tick_coverage(self):
+        """Every 6h, ping when an app that can take money is not wired to the
+        live path — no RC project at all, or an RC project whose webhook has
+        never fired despite revenue. Only a change in the gap set re-pings."""
+        now = time.time()
+        if now - self._last_coverage < 21600:
+            return
+        self._last_coverage = now
+        if not self.state.get("alerts_enabled", True):
+            return
+        unwired, silent = self._coverage_gaps()
+        signature = json.dumps([unwired, silent], sort_keys=True)
+        if signature == self.state.get("coverage_sig"):
+            return
+        self.state["coverage_sig"] = signature
+        save_state(self.state)
+        if not unwired and not silent:
+            return
+        text = self._coverage_text(unwired, silent)
+        for chat_id in self.chat_ids:
+            self.send(text, chat_id=chat_id)
+        log(f"coverage gaps: {text}")
+
     def run_forever(self):
         try:
             self.tg_api("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in COMMANDS]})
@@ -884,7 +973,8 @@ class StoreBot:
         log("storebot online")
         while True:
             for tick in (self._tick_hook, self._tick_revenue,
-                         self._tick_appstore, self._tick_reviews):
+                         self._tick_appstore, self._tick_reviews,
+                         self._tick_coverage):
                 try:
                     tick()
                 except Exception as e:
@@ -961,6 +1051,8 @@ class StoreBot:
             self.send("Commands:\n" + "\n".join(f"/{c} — {d}" for c, d in COMMANDS))
         elif cmd == "/status":
             self.send(self._status_text())
+        elif cmd == "/coverage":
+            self.send(self._coverage_text(*self._coverage_gaps()))
         elif cmd == "/on":
             self.state["alerts_enabled"] = True
             save_state(self.state)
@@ -1035,6 +1127,7 @@ class StoreBot:
 
 COMMANDS = [
     ("status", "bot health"),
+    ("coverage", "apps not wired to live sale pings"),
     ("on", "enable alerts"),
     ("off", "disable alerts"),
     ("help", "list commands"),

@@ -26,7 +26,13 @@ actually landed.
 5★ and 1★ reviews ping. First run baselines silently — history never
 replays.
 
-Commands: `/status`, `/on`, `/off`, `/help`.
+**Coverage audit**: every 6h storebot compares its RevenueCat projects
+against the App Store apps that actually sell something (any IAP or
+subscription group) and pings the gaps — apps with no RC project, and RC
+projects that earn but whose webhook has never fired. It re-pings only when
+the gap set changes. `/coverage` runs it on demand.
+
+Commands: `/status`, `/coverage`, `/on`, `/off`, `/help`.
 
 ## Install
 
