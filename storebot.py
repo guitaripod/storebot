@@ -562,11 +562,15 @@ class StoreBot:
         return m.group(0) if m else ""
 
     def _ambiguous_brands(self):
-        """Leading words carried by more than one App Store app, which are too
-        weak to attribute a RevenueCat project by."""
-        counts = Counter(self._brand(a["attributes"].get("name", ""))
-                         for a in (self._apps_cache or {}).get("apps") or [])
-        return {b for b, n in counts.items() if b and n > 1}
+        """Leading words shared by more App Store apps than RevenueCat projects,
+        which are therefore too weak to attribute a project by — "Master of
+        Flags" must not claim "Master of Inventory". A brand carried by as many
+        projects as apps is a product family (both Flaccy SKUs) and still
+        matches."""
+        apps = Counter(self._brand(a["attributes"].get("name", ""))
+                       for a in (self._apps_cache or {}).get("apps") or [])
+        projects = Counter(self._brand(p["name"]) for p in self._projects_ok())
+        return {b for b, n in apps.items() if b and n > projects.get(b, 0)}
 
     def _is_rc_covered(self, app_title):
         """True when an ASC app title belongs to a RevenueCat-watched project
