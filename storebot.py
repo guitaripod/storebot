@@ -586,6 +586,12 @@ class StoreBot:
                 return True
         return False
 
+    def _is_live_covered(self, app_title):
+        """True when an app's IAP rows already ping the moment they happen —
+        through RevenueCat, or through Apple's own server notifications."""
+        return (self._is_rc_covered(app_title)
+                or app_title in self.state.get("asn_apps", {}))
+
     def _asc_money_pings(self, rows):
         """Ping lines for every revenue row in a SALES report that storebot's
         RevenueCat path cannot see: all paid-app downloads plus IAP/subscription
@@ -611,7 +617,7 @@ class StoreBot:
             app_name = sku_map.get(parent) if parent else None
             is_iap = app_name is not None or ptype.startswith("IA")
             app_name = app_name or title
-            if is_iap and self._is_rc_covered(app_name):
+            if is_iap and self._is_live_covered(app_name):
                 continue
             label = f"{app_name} · {title}" if is_iap and title != app_name else app_name
             flag = self._flag(row.get("Country Code"))
@@ -649,6 +655,8 @@ class StoreBot:
 
     def _products(self, project):
         """{product key -> display name} for one project, cached 24h."""
+        if "project_id" not in project:
+            return self._asc_products(project)
         entry = self._products_cache.get(project["project_id"])
         if entry and time.time() - entry["at"] < 86400:
             return entry["map"]
@@ -669,6 +677,61 @@ class StoreBot:
         except requests.RequestException as e:
             log(f"products {project['name']}: {e}", "WARN")
         return products
+
+    def _asc_products(self, project):
+        """{product id -> display name} for an App Store app storebot watches
+        through Apple's notifications rather than RevenueCat, cached 24h."""
+        app_id = project.get("app_id")
+        if not app_id:
+            return {}
+        entry = self._products_cache.get(app_id)
+        if entry and time.time() - entry["at"] < 86400:
+            return entry["map"]
+        names = {}
+        try:
+            for item in (self.asc_get(f"/v1/apps/{app_id}/inAppPurchasesV2?limit=200")
+                         .get("data") or []):
+                attr = item.get("attributes") or {}
+                if attr.get("productId") and attr.get("name"):
+                    names[attr["productId"]] = attr["name"]
+                    names[attr["productId"].lower()] = attr["name"]
+            for group in (self.asc_get(f"/v1/apps/{app_id}/subscriptionGroups?limit=200")
+                          .get("data") or []):
+                subs = self.asc_get(f"/v1/subscriptionGroups/{group['id']}"
+                                    f"/subscriptions?limit=200")
+                for sub in subs.get("data") or []:
+                    attr = sub.get("attributes") or {}
+                    if attr.get("productId") and attr.get("name"):
+                        names[attr["productId"]] = attr["name"]
+                        names[attr["productId"].lower()] = attr["name"]
+        except requests.RequestException as e:
+            log(f"asc products {app_id}: {e}", "WARN")
+            return names
+        self._products_cache[app_id] = {"at": time.time(), "map": names}
+        return names
+
+    def _apple_project(self, bundle_id):
+        """The App Store app behind a bundle id from Apple's notifications,
+        shaped like an RC project so one ping path serves both. Seeing one at
+        all proves the app's notification URL is live, which is recorded so the
+        daily sweep stops reporting the same sale a day later."""
+        try:
+            self._ensure_apps()
+        except requests.RequestException as e:
+            log(f"apps list: {e}", "WARN")
+            return None
+        for app in self._apps_cache["apps"]:
+            attr = app["attributes"]
+            if attr.get("bundleId") != bundle_id:
+                continue
+            name = attr.get("name", bundle_id)
+            live = self.state.setdefault("asn_apps", {})
+            if name not in live:
+                live[name] = time.time()
+                save_state(self.state)
+            return {"name": name, "app_id": app["id"]}
+        log(f"apple event for unknown bundle {bundle_id!r}", "WARN")
+        return None
 
     def _seed_ever_sold(self):
         """Mark projects that already have revenue so their next sale is not
@@ -708,7 +771,8 @@ class StoreBot:
             days[project["name"]] = day
             tag += " 🌅 1st today"
         products = self._products(project)
-        product = products.get(event.get("product_id") or "", "")
+        pid = event.get("product_id") or ""
+        product = products.get(pid) or products.get(pid.lower(), "")
         label = project["name"]
         if product and project["name"].lower() in product.lower():
             label = product[:40]
@@ -748,9 +812,12 @@ class StoreBot:
             if event_id in seen:
                 continue
             seen.add(event_id)
-            slug = project_name.lower()
-            project = next((p for p in self._projects_ok()
-                            if p["env"].replace("RC_SECRET_", "").lower() == slug), None)
+            if project_name.startswith("apple:"):
+                project = self._apple_project(project_name[len("apple:"):])
+            else:
+                slug = project_name.lower()
+                project = next((p for p in self._projects_ok()
+                                if p["env"].replace("RC_SECRET_", "").lower() == slug), None)
             if project is None:
                 log(f"hook event for unknown project {project_name!r}", "WARN")
                 continue
@@ -920,7 +987,7 @@ class StoreBot:
         unwired = []
         for app in self._apps_cache["apps"]:
             name = app["attributes"].get("name", "?")
-            if self._is_rc_covered(name):
+            if self._is_live_covered(name):
                 continue
             if self._app_monetizes(app["id"]):
                 unwired.append(name)

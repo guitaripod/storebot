@@ -26,6 +26,15 @@ actually landed.
 5★ and 1★ reviews ping. First run baselines silently — history never
 replays.
 
+**App Store sales without RevenueCat** (Master of Flags, Master of Inventory,
+PixiePocket, Tailscode): Apple's own App Store Server Notifications V2, posted
+to the same relay at `/asn?k=<STOREBOT_HOOK_SECRET>` and drained on the same
+30s tick, so they ping live like everything else. Set each app's **Production
+Server URL** to that address (App Store Connect → App Information → App Store
+Server Notifications, version 2) — there is no API for it. Product names come
+from the app's ASC in-app purchases, and once an app has delivered one
+notification the daily sweep stops reporting its sales a day later.
+
 **Coverage audit**: every 6h storebot compares its RevenueCat projects
 against the App Store apps that actually sell something (any IAP or
 subscription group) and pings the gaps — apps with no RC project, and RC
