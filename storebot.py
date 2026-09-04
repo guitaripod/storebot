@@ -937,7 +937,7 @@ class StoreBot:
     def _coverage_text(self, unwired, silent):
         if not unwired and not silent:
             return "\u2705 every earning app is wired to the webhook path."
-        lines = ["\u26a0\ufe0f sales that will not ping live:"]
+        lines = ["\u26a0\ufe0f sales that land next-day via the App Store sweep, not live:"]
         if unwired:
             lines.append("no RC project: " + ", ".join(unwired))
         if silent:
