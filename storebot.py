@@ -23,8 +23,11 @@ Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
     double-pings. Apple publishes DAILY reports with ~1 day lag and retries
     until the report lands, so these pings arrive next morning.
 
-  - App reviews: polls App Store Connect customerReviews and pings new 5★ and
-    1★ reviews (default every 30 min).
+  - App reviews: polls App Store Connect customerReviews and pings every new
+    written review (default every 30 min), then sweeps per-storefront rating
+    counts (public iTunes lookup — the ASC API exposes none) so stars-only
+    ratings ping too; a written review is subtracted from its storefront's
+    count delta, so nothing double-pings.
 
 Refunds are tracked silently. Daily revenue milestones ride along with pings.
 Control commands: /status, /on, /off, /help.
@@ -65,6 +68,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -121,6 +125,44 @@ CURRENCY_SYMBOLS = {
 }
 
 MONEY_EVENT_TYPES = {"INITIAL_PURCHASE", "RENEWAL", "NON_RENEWING_PURCHASE"}
+
+TERRITORY_ALPHA2 = {
+    "AFG": "af", "AGO": "ao", "AIA": "ai", "ALB": "al", "ARE": "ae",
+    "ARG": "ar", "ARM": "am", "ATG": "ag", "AUS": "au", "AUT": "at",
+    "AZE": "az", "BEL": "be", "BEN": "bj", "BFA": "bf", "BGR": "bg",
+    "BHR": "bh", "BHS": "bs", "BIH": "ba", "BLR": "by", "BLZ": "bz",
+    "BMU": "bm", "BOL": "bo", "BRA": "br", "BRB": "bb", "BRN": "bn",
+    "BTN": "bt", "BWA": "bw", "CAN": "ca", "CHE": "ch", "CHL": "cl",
+    "CHN": "cn", "CIV": "ci", "CMR": "cm", "COD": "cd", "COG": "cg",
+    "COL": "co", "CPV": "cv", "CRI": "cr", "CYM": "ky", "CYP": "cy",
+    "CZE": "cz", "DEU": "de", "DMA": "dm", "DNK": "dk", "DOM": "do",
+    "DZA": "dz", "ECU": "ec", "EGY": "eg", "ESP": "es", "EST": "ee",
+    "FIN": "fi", "FJI": "fj", "FRA": "fr", "FSM": "fm", "GAB": "ga",
+    "GBR": "gb", "GEO": "ge", "GHA": "gh", "GMB": "gm", "GNB": "gw",
+    "GRC": "gr", "GRD": "gd", "GTM": "gt", "GUY": "gy", "HKG": "hk",
+    "HND": "hn", "HRV": "hr", "HUN": "hu", "IDN": "id", "IND": "in",
+    "IRL": "ie", "IRQ": "iq", "ISL": "is", "ISR": "il", "ITA": "it",
+    "JAM": "jm", "JOR": "jo", "JPN": "jp", "KAZ": "kz", "KEN": "ke",
+    "KGZ": "kg", "KHM": "kh", "KNA": "kn", "KOR": "kr", "KWT": "kw",
+    "LAO": "la", "LBN": "lb", "LBR": "lr", "LBY": "ly", "LCA": "lc",
+    "LKA": "lk", "LTU": "lt", "LUX": "lu", "LVA": "lv", "MAC": "mo",
+    "MAR": "ma", "MDA": "md", "MDG": "mg", "MDV": "mv", "MEX": "mx",
+    "MKD": "mk", "MLI": "ml", "MLT": "mt", "MMR": "mm", "MNE": "me",
+    "MNG": "mn", "MOZ": "mz", "MRT": "mr", "MSR": "ms", "MUS": "mu",
+    "MWI": "mw", "MYS": "my", "NAM": "na", "NER": "ne", "NGA": "ng",
+    "NIC": "ni", "NLD": "nl", "NOR": "no", "NPL": "np", "NRU": "nr",
+    "NZL": "nz", "OMN": "om", "PAK": "pk", "PAN": "pa", "PER": "pe",
+    "PHL": "ph", "PLW": "pw", "PNG": "pg", "POL": "pl", "PRT": "pt",
+    "PRY": "py", "QAT": "qa", "ROU": "ro", "RUS": "ru", "RWA": "rw",
+    "SAU": "sa", "SEN": "sn", "SGP": "sg", "SLB": "sb", "SLE": "sl",
+    "SLV": "sv", "SRB": "rs", "STP": "st", "SUR": "sr", "SVK": "sk",
+    "SVN": "si", "SWE": "se", "SWZ": "sz", "SYC": "sc", "TCA": "tc",
+    "TCD": "td", "THA": "th", "TJK": "tj", "TKM": "tm", "TON": "to",
+    "TTO": "tt", "TUN": "tn", "TUR": "tr", "TWN": "tw", "TZA": "tz",
+    "UGA": "ug", "UKR": "ua", "URY": "uy", "USA": "us", "UZB": "uz",
+    "VCT": "vc", "VEN": "ve", "VGB": "vg", "VNM": "vn", "VUT": "vu",
+    "XKS": "xk", "YEM": "ye", "ZAF": "za", "ZMB": "zm", "ZWE": "zw",
+}
 
 
 def log(msg, level="INFO"):
@@ -660,7 +702,7 @@ class StoreBot:
     def _flag(country):
         code = (country or "").strip().upper()
         if len(code) == 3 and code.isalpha():
-            code = code[:2]
+            code = ((TERRITORY_ALPHA2.get(code) or code[:2]).upper())
         if len(code) != 2 or not code.isalpha():
             return ""
         return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
@@ -872,9 +914,15 @@ class StoreBot:
     # ----------------------------------------------------------------- reviews
 
     def _tick_reviews(self):
-        """Poll App Store Connect customerReviews; ping new 5★ and 1★ only.
+        """Poll App Store Connect customerReviews and ping every new written
+        review at any star level, then sweep storefront rating counts so
+        stars-only ratings — invisible to customerReviews — ping too.
 
-        First run baselines silently so history never replays."""
+        Storefront counts lag and include written reviews, so each written
+        ping banks a per-territory "pending" count that the sweep consumes
+        when the storefront count catches up; the remainder is the
+        stars-only delta. First run baselines both silently so history
+        never replays."""
         now = time.time()
         if now - self._last_review < self.review_seconds:
             return
@@ -887,49 +935,154 @@ class StoreBot:
             log(f"apps list: {e}", "WARN")
             return
         seen = self.state.setdefault("reviews_seen", {})
+        pending = self.state.setdefault("review_pending", {})
         pings = []
+        dirty = False
         for app in self._apps_cache["apps"]:
             app_id = app["id"]
             name = app["attributes"].get("name", "?")
             try:
-                data = self.asc_get(f"/v1/apps/{app_id}/customerReviews?limit=50")
+                data = self.asc_get(
+                    f"/v1/apps/{app_id}/customerReviews?limit=50&sort=-createdDate")
             except requests.RequestException as e:
                 log(f"reviews {name}: {e}", "WARN")
                 continue
             reviews = data.get("data") or []
-            if not reviews:
-                continue
             known = set(seen.get(app_id) or [])
             fresh = [rv for rv in reviews if rv["id"] not in known]
             if app_id not in seen:
                 seen[app_id] = [rv["id"] for rv in reviews][-200:]
-                save_state(self.state)
+                dirty = True
                 continue
-            if fresh:
-                seen[app_id] = (seen[app_id] + [rv["id"] for rv in fresh])[-200:]
-                save_state(self.state)
+            if not fresh:
+                continue
+            seen[app_id] = (seen[app_id] + [rv["id"] for rv in fresh])[-200:]
+            dirty = True
+            pend = pending.setdefault(app_id, {})
             for rv in fresh:
                 attrs = rv["attributes"]
-                rating = attrs.get("rating")
-                if rating not in (1, 5):
-                    continue
+                terr = (attrs.get("territory") or "").upper()
+                rating = attrs.get("rating") or 1
+                banked = pend.get(terr) or [0, 0]
+                pend[terr] = [min(banked[0] + 1, 50), min(banked[1] + rating, 250)]
+                stars = "⭐" * (attrs.get("rating") or 1)
                 title = (attrs.get("title") or "").strip()
                 body = (attrs.get("body") or "").strip()
                 text = (title or body).replace("\n", " ")[:120]
-                if not text:
-                    continue
-                stars = "⭐⭐⭐⭐⭐" if rating == 5 else "⭐"
                 nick = (attrs.get("reviewerNickname") or "user").strip()
-                flag = self._flag(attrs.get("territory"))
-                pings.append(f"{stars} {name} — “{text}” — {nick} {flag}".strip())
+                flag = self._flag(terr)
+                if text:
+                    pings.append(f"{stars} {name} — “{text}” — {nick} {flag}".strip())
+                else:
+                    pings.append(f"{stars} {name} — {nick} {flag}".strip())
+        if dirty:
+            save_state(self.state)
         if pings:
             for chat_id in self.chat_ids:
                 for chunk in self._chunks("\n".join(pings)):
                     self.send(chunk, chat_id=chat_id)
             log(f"review pings: {len(pings)}")
+        self._sweep_ratings()
+
+    def _sweep_ratings(self):
+        """Diff per-storefront userRatingCount against the persisted baseline
+        and ping stars-only ratings: the count delta minus the written reviews
+        already pinged (banked per territory by _tick_reviews).
+
+        The ASC API has no rating-count endpoint, so the public iTunes lookup
+        is the only source; one request per storefront returns every app at
+        once. When exactly one rating is new, the old and new storefront
+        averages solve for its star value; otherwise the ping carries the
+        count and the average move. First observation of a storefront
+        baselines silently."""
+        apps = self._apps_cache["apps"]
+        if not apps:
+            return
+        ids = ",".join(a["id"] for a in apps)
+        names = {a["id"]: a["attributes"].get("name", "?") for a in apps}
+        base = self.state.setdefault("rating_counts", {})
+        avgs = self.state.setdefault("rating_avgs", {})
+        pend_all = self.state.setdefault("review_pending", {})
+        terr_of = {v: k for k, v in TERRITORY_ALPHA2.items()}
+        dirty = False
+        pings = []
+        def lookup(country):
+            try:
+                r = requests.get("https://itunes.apple.com/lookup", timeout=30,
+                                 params={"id": ids, "country": country})
+                r.raise_for_status()
+                return country, r.json().get("results") or []
+            except (requests.RequestException, ValueError) as e:
+                log(f"ratings lookup {country}: {e}", "WARN")
+                return country, None
+
+        with ThreadPoolExecutor(8) as pool:
+            fetched = pool.map(lookup, sorted(set(TERRITORY_ALPHA2.values())))
+            for country, app_results in fetched:
+                if app_results is None:
+                    continue
+                for res in app_results:
+                    app_id = str(res.get("trackId") or "")
+                    if app_id not in names:
+                        continue
+                    n = res.get("userRatingCount") or 0
+                    avg = res.get("averageUserRating") or 0.0
+                    old_n = (base.get(app_id) or {}).get(country)
+                    if old_n is None:
+                        base.setdefault(app_id, {})[country] = n
+                        avgs.setdefault(app_id, {})[country] = avg
+                        dirty = True
+                        continue
+                    if n == old_n:
+                        continue
+                    old_avg = avgs.get(app_id, {}).get(country, 0.0)
+                    base[app_id][country] = n
+                    avgs[app_id][country] = avg
+                    dirty = True
+                    if n < old_n:
+                        continue
+                    delta = n - old_n
+                    terr = terr_of.get(country, "")
+                    pend = pend_all.get(app_id) or {}
+                    banked = pend.get(terr) or [0, 0]
+                    consumed = min(delta, banked[0])
+                    written_sum = (banked[1] if consumed == banked[0]
+                                   else round(banked[1] * consumed / banked[0]))
+                    if consumed:
+                        left = banked[0] - consumed
+                        if left:
+                            pend[terr] = [left, banked[1] - written_sum]
+                        else:
+                            pend.pop(terr, None)
+                        if pend:
+                            pend_all[app_id] = pend
+                        else:
+                            pend_all.pop(app_id, None)
+                    stars_only = delta - consumed
+                    if stars_only <= 0:
+                        continue
+                    new_sum = avg * n - old_avg * old_n
+                    name = names[app_id]
+                    flag = self._flag(country)
+                    if stars_only == 1:
+                        star = new_sum - written_sum
+                        if abs(star - round(star)) <= 0.25 and 1 <= round(star) <= 5:
+                            stars = "⭐" * round(star)
+                            pings.append(f"{stars} {name} — rating only {flag}".strip())
+                        else:
+                            pings.append(f"{name} — new rating, avg {avg:.1f} {flag}".strip())
+                    else:
+                        pings.append(f"{name} — {stars_only} new ratings "
+                                     f"(avg {old_avg:.1f}→{avg:.1f}) {flag}".strip())
+        if dirty:
+            save_state(self.state)
+        if pings:
+            for chat_id in self.chat_ids:
+                for chunk in self._chunks("\n".join(pings)):
+                    self.send(chunk, chat_id=chat_id)
+            log(f"rating pings: {len(pings)}")
 
     # ------------------------------------------------------------------ loop
-
 
     def _tick_revenue(self):
         """Poll RC's realtime revenue metric and ping on new revenue/refunds.

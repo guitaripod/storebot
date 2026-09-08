@@ -22,9 +22,12 @@ double-pings. Refunds are tracked silently.
 report checked once a day (default 09:00); pings only when a paid download
 actually landed.
 
-**App reviews**: App Store Connect customerReviews polled every 30 min; new
-5★ and 1★ reviews ping. First run baselines silently — history never
-replays.
+**App reviews**: App Store Connect customerReviews polled every 30 min; every
+new written review pings (any star level). Stars-only ratings are invisible
+there, so the same tick also diffs per-storefront rating counts (public
+iTunes lookup — the ASC API exposes none) and pings the remainder, with the
+star count inferred from the storefront average when exactly one new rating
+landed. First run baselines silently — history never replays.
 
 **App Store sales without RevenueCat** (Master of Flags, Master of Inventory,
 PixiePocket, Tailscode): Apple's own App Store Server Notifications V2, posted
