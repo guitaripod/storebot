@@ -27,7 +27,8 @@ Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
     written review (default every 30 min), then sweeps per-storefront rating
     counts (public iTunes lookup — the ASC API exposes none) so stars-only
     ratings ping too; a written review is subtracted from its storefront's
-    count delta, so nothing double-pings.
+    count delta, so nothing double-pings. The lookup's count wobbles, so the
+    diff runs against a high-water baseline and lower reads are absorbed.
 
 Refunds are tracked silently. Daily revenue milestones ride along with pings.
 Control commands: /status, /on, /off, /help.
@@ -985,23 +986,35 @@ class StoreBot:
         self._sweep_ratings()
 
     def _sweep_ratings(self):
-        """Diff per-storefront userRatingCount against the persisted baseline
-        and ping stars-only ratings: the count delta minus the written reviews
-        already pinged (banked per territory by _tick_reviews).
+        """Diff per-storefront userRatingCount against a high-water baseline
+        and ping stars-only ratings: the count delta minus the written
+        reviews already pinged (banked per territory by _tick_reviews).
 
         The ASC API has no rating-count endpoint, so the public iTunes lookup
         is the only source; one request per storefront returns every app at
-        once. When exactly one rating is new, the old and new storefront
-        averages solve for its star value; otherwise the ping carries the
-        count and the average move. First observation of a storefront
-        baselines silently."""
+        once. The lookup's count wobbles — stale CDN caches and Apple
+        re-tallies can read lower than moments before — so the baseline is
+        the highest count ever accepted: only a count above it is a new
+        rating, a regression is absorbed and logged. A rating Apple removes
+        and replaces within the same watermark therefore goes unpinged; that
+        is the price of never double-pinging a wobble. When exactly one
+        stars-only rating is new, the accepted and new storefront sums solve
+        for its star value; otherwise the ping carries the count and the
+        average move. First observation of a storefront baselines silently.
+
+        A pre-2026-09-12 state carries counts but no watermarks; migrating
+        at the persisted count could replay history if that count lagged a
+        wobble peak. Migration therefore seeds each watermark provisionally:
+        one sweep confirms the seed with an unchanged read before any higher
+        read may ping."""
         apps = self._apps_cache["apps"]
         if not apps:
             return
         ids = ",".join(a["id"] for a in apps)
         names = {a["id"]: a["attributes"].get("name", "?") for a in apps}
-        base = self.state.setdefault("rating_counts", {})
+        counts = self.state.setdefault("rating_counts", {})
         avgs = self.state.setdefault("rating_avgs", {})
+        highs = self.state.setdefault("rating_highs", {})
         pend_all = self.state.setdefault("review_pending", {})
         terr_of = {v: k for k, v in TERRITORY_ALPHA2.items()}
         dirty = False
@@ -1027,21 +1040,31 @@ class StoreBot:
                         continue
                     n = res.get("userRatingCount") or 0
                     avg = res.get("averageUserRating") or 0.0
-                    old_n = (base.get(app_id) or {}).get(country)
-                    if old_n is None:
-                        base.setdefault(app_id, {})[country] = n
+                    old = (counts.get(app_id) or {}).get(country)
+                    old_avg = avgs.get(app_id, {}).get(country, 0.0)
+                    high = (highs.get(app_id) or {}).get(country)
+                    if old is None:
+                        counts.setdefault(app_id, {})[country] = n
                         avgs.setdefault(app_id, {})[country] = avg
+                        highs.setdefault(app_id, {})[country] = [n, avg * n, 0]
                         dirty = True
                         continue
-                    if n == old_n:
+                    if high is None:
+                        high = [old, old_avg * old, 1]
+                        highs.setdefault(app_id, {})[country] = high
+                    if n == old:
+                        if high[2]:
+                            high[2] = 0
+                            dirty = True
                         continue
-                    old_avg = avgs.get(app_id, {}).get(country, 0.0)
-                    base[app_id][country] = n
+                    counts[app_id][country] = n
                     avgs[app_id][country] = avg
                     dirty = True
-                    if n < old_n:
+                    if n < high[0]:
+                        log(f"ratings {names[app_id]} {country} "
+                            f"regressed {high[0]}→{n}; absorbing")
                         continue
-                    delta = n - old_n
+                    delta = n - high[0]
                     terr = terr_of.get(country, "")
                     pend = pend_all.get(app_id) or {}
                     banked = pend.get(terr) or [0, 0]
@@ -1060,20 +1083,27 @@ class StoreBot:
                             pend_all.pop(app_id, None)
                     stars_only = delta - consumed
                     if stars_only <= 0:
-                        continue
-                    new_sum = avg * n - old_avg * old_n
-                    name = names[app_id]
-                    flag = self._flag(country)
-                    if stars_only == 1:
-                        star = new_sum - written_sum
-                        if abs(star - round(star)) <= 0.25 and 1 <= round(star) <= 5:
-                            stars = "⭐" * round(star)
-                            pings.append(f"{stars} {name} — rating only {flag}".strip())
-                        else:
-                            pings.append(f"{name} — new rating, avg {avg:.1f} {flag}".strip())
+                        highs[app_id][country] = [n, avg * n, 0]
+                    elif high[2]:
+                        log(f"ratings {names[app_id]} {country}: first read after "
+                            f"seed, holding {stars_only} new unconfirmed")
+                        highs[app_id][country] = [n, avg * n, 1]
                     else:
-                        pings.append(f"{name} — {stars_only} new ratings "
-                                     f"(avg {old_avg:.1f}→{avg:.1f}) {flag}".strip())
+                        new_sum = avg * n - high[1]
+                        acc_avg = high[1] / high[0] if high[0] else old_avg
+                        name = names[app_id]
+                        flag = self._flag(country)
+                        if stars_only == 1:
+                            star = new_sum - written_sum
+                            if abs(star - round(star)) <= 0.25 and 1 <= round(star) <= 5:
+                                stars = "⭐" * round(star)
+                                pings.append(f"{stars} {name} — rating only {flag}".strip())
+                            else:
+                                pings.append(f"{name} — new rating, avg {avg:.1f} {flag}".strip())
+                        else:
+                            pings.append(f"{name} — {stars_only} new ratings "
+                                         f"(avg {acc_avg:.1f}→{avg:.1f}) {flag}".strip())
+                        highs[app_id][country] = [n, avg * n, 0]
         if dirty:
             save_state(self.state)
         if pings:

@@ -27,7 +27,12 @@ new written review pings (any star level). Stars-only ratings are invisible
 there, so the same tick also diffs per-storefront rating counts (public
 iTunes lookup — the ASC API exposes none) and pings the remainder, with the
 star count inferred from the storefront average when exactly one new rating
-landed. First run baselines silently — history never replays.
+landed. First run baselines silently — history never replays. The lookup's
+count wobbles (stale caches, Apple re-tallies), so counts are diffed against
+a high-water baseline: a lower read is absorbed and logged, never re-pinged.
+On upgrade from a pre-watermark state, each watermark seeds provisionally:
+the first read above the old count is held one sweep (unchanged read
+confirms it) so history never replays.
 
 **App Store sales without RevenueCat** (Master of Flags, Master of Inventory,
 PixiePocket, Tailscode): Apple's own App Store Server Notifications V2, posted
