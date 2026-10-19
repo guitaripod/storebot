@@ -56,6 +56,7 @@ CLI:
 
 import base64
 import csv
+import fcntl
 import gzip
 import io
 import json
@@ -87,6 +88,9 @@ STATE_FILE = HOME / ".local/state/storebot/state.json"
 LOG_DIR = HOME / ".local/state/storebot"
 
 TG_MAX_LEN = 4000
+FALLBACK_GRACE_SECONDS = 1800
+SALES_SEEN_SECONDS = 90 * 24 * 3600
+SALES_SEEN_MAX = 5000
 
 APP_EMOJI = {
     "solar beam": ["☀️", "🔆"],
@@ -239,6 +243,7 @@ def load_state():
 
 
 _STATE_LOCK = threading.Lock()
+_INSTANCE_LOCK = None
 
 
 def save_state(state):
@@ -292,15 +297,30 @@ class StoreBot:
             self.send(text)
             print("sent")
             return 0
+        if not self.acquire_lock():
+            return 1
         if "--replay" in sys.argv:
             self._replay()
             return 0
         self.run_forever()
         return 0
 
+    def acquire_lock(self):
+        global _INSTANCE_LOCK
+        path = LOG_DIR / "storebot.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("w")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("storebot is already running", file=sys.stderr)
+            return False
+        _INSTANCE_LOCK = handle
+        return True
+
     # ---------------------------------------------------------------- telegram
 
-    def tg_api(self, method, payload=None, timeout=60):
+    def tg_api(self, method, payload=None, timeout=60, retry=True):
         url = f"{self.api_base}/bot{self.token}/{method}"
         body = json.dumps(payload or {}).encode()
         last_err = None
@@ -314,14 +334,23 @@ class StoreBot:
                     data = json.loads(e.read())
                 except (ValueError, OSError):
                     data = None
-                if data is None or e.code >= 500:
-                    last_err = e
+                retry_after = (data.get("parameters") or {}).get("retry_after") if isinstance(data, dict) else None
+                if retry_after:
+                    time.sleep(retry_after + 1)
+                    continue
+                last_err = e
+                if retry and (data is None or e.code >= 500):
                     time.sleep(min(2 ** attempt, 30))
                     continue
+                if isinstance(data, dict) and not data.get("ok"):
+                    raise RuntimeError(f"telegram {method}: {data.get('description', 'unknown')}")
+                raise RuntimeError(f"telegram {method}: http {e.code}")
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 last_err = e
-                time.sleep(min(2 ** attempt, 30))
-                continue
+                if retry:
+                    time.sleep(min(2 ** attempt, 30))
+                    continue
+                raise RuntimeError(f"telegram {method}: {e}")
             if data.get("ok"):
                 return data.get("result")
             retry_after = (data.get("parameters") or {}).get("retry_after")
@@ -337,7 +366,14 @@ class StoreBot:
             raise RuntimeError("no chat id configured")
         for chunk in self._chunks(text):
             self.tg_api("sendMessage", {"chat_id": chat_id, "text": chunk,
-                                        "disable_notification": silent})
+                                        "disable_notification": silent}, retry=False)
+
+    def broadcast(self, text, silent=False):
+        for chat_id in self.chat_ids:
+            try:
+                self.send(text, silent=silent, chat_id=chat_id)
+            except RuntimeError as e:
+                log(f"telegram {chat_id}: {e}", "ERROR")
 
     @staticmethod
     def _chunks(text):
@@ -808,6 +844,35 @@ class StoreBot:
                 ever[p["name"]] = True
         save_state(self.state)
 
+    @staticmethod
+    def _sale_key(event, event_id):
+        txn = str(event.get("transaction_id") or "").strip()
+        return f"txn:{txn}" if txn else f"event:{event_id}"
+
+    def _claim_sale(self, key, now):
+        seen = self.state.setdefault("sales_seen", {})
+        if key in seen:
+            return False
+        seen[key] = now
+        cutoff = now - SALES_SEEN_SECONDS
+        for old_key, stamp in list(seen.items()):
+            if stamp < cutoff:
+                seen.pop(old_key, None)
+        if len(seen) > SALES_SEEN_MAX:
+            excess = len(seen) - SALES_SEEN_MAX
+            for old_key, _ in sorted(seen.items(), key=lambda item: item[1])[:excess]:
+                seen.pop(old_key, None)
+        return True
+
+    @staticmethod
+    def _is_money_event(event):
+        if event.get("type") not in MONEY_EVENT_TYPES:
+            return False
+        if (event.get("environment") or "").upper() != "PRODUCTION":
+            return False
+        price = event.get("price_in_purchased_currency") or event.get("price") or 0
+        return price > 0
+
     def _hook_line(self, project, event):
         ev_type = event.get("type") or ""
         if ev_type not in MONEY_EVENT_TYPES:
@@ -869,6 +934,7 @@ class StoreBot:
         seen = set(processed)
         pings = []
         affected = set()
+        fallback = self.state.setdefault("fallback_sent", {})
         for entry in events:
             event_id = entry.get("event_id") or ""
             project_name = (entry.get("project") or "").strip()
@@ -888,7 +954,16 @@ class StoreBot:
                 event = json.loads(entry.get("payload") or "{}")
             except (json.JSONDecodeError, TypeError):
                 continue
-            self.state.setdefault("hook_seen", {})[project["name"]] = time.time()
+            self.state.setdefault("hook_seen", {})[project["name"]] = now
+            if not self._is_money_event(event):
+                continue
+            key = self._sale_key(event, event_id)
+            if not self._claim_sale(key, now):
+                log(f"hook duplicate sale {key} ({event_id}); skipping", "INFO")
+                continue
+            if fallback.get(project["name"], 0) + FALLBACK_GRACE_SECONDS > now:
+                log(f"hook sale {key} already covered by revenue fallback; skipping", "INFO")
+                continue
             line = self._hook_line(project, event)
             if line:
                 pings.append(line)
@@ -898,12 +973,11 @@ class StoreBot:
         if affected:
             suppress = self.state.setdefault("hook_suppress", {})
             for name in affected:
-                suppress[name] = time.time() + 1800
+                suppress[name] = now + 1800
             save_state(self.state)
         if pings:
             text = "\n".join(pings)
-            for chat_id in self.chat_ids:
-                self.send(text, chat_id=chat_id)
+            self.broadcast(text)
             log(f"hook pings: {'; '.join(pings)}")
         try:
             ids = [e["id"] for e in events]
@@ -960,12 +1034,23 @@ class StoreBot:
             seen[app_id] = (seen[app_id] + [rv["id"] for rv in fresh])[-200:]
             dirty = True
             pend = pending.setdefault(app_id, {})
+            holds = self.state.setdefault("rating_holds", {})
             for rv in fresh:
                 attrs = rv["attributes"]
                 terr = (attrs.get("territory") or "").upper()
                 rating = attrs.get("rating") or 1
                 banked = pend.get(terr) or [0, 0]
                 pend[terr] = [min(banked[0] + 1, 50), min(banked[1] + rating, 250)]
+                country = TERRITORY_ALPHA2.get(terr, terr.lower())
+                hold = (holds.get(app_id) or {}).get(country)
+                if hold:
+                    hold["stars"] = max(0, hold.get("stars", 0) - 1)
+                    hold["star_guess"] = None
+                    if hold["stars"] == 0:
+                        holds[app_id].pop(country, None)
+                    if not holds.get(app_id):
+                        holds.pop(app_id, None)
+                    dirty = True
                 stars = "⭐" * (attrs.get("rating") or 1)
                 title = (attrs.get("title") or "").strip()
                 body = (attrs.get("body") or "").strip()
@@ -979,9 +1064,7 @@ class StoreBot:
         if dirty:
             save_state(self.state)
         if pings:
-            for chat_id in self.chat_ids:
-                for chunk in self._chunks("\n".join(pings)):
-                    self.send(chunk, chat_id=chat_id)
+            self.broadcast("\n".join(pings))
             log(f"review pings: {len(pings)}")
         self._sweep_ratings()
 
@@ -1016,6 +1099,8 @@ class StoreBot:
         avgs = self.state.setdefault("rating_avgs", {})
         highs = self.state.setdefault("rating_highs", {})
         pend_all = self.state.setdefault("review_pending", {})
+        holds = self.state.setdefault("rating_holds", {})
+        hold_seconds = max(self.review_seconds * 2 + 300, 3600)
         terr_of = {v: k for k, v in TERRITORY_ALPHA2.items()}
         dirty = False
         pings = []
@@ -1091,25 +1176,58 @@ class StoreBot:
                     else:
                         new_sum = avg * n - high[1]
                         acc_avg = high[1] / high[0] if high[0] else old_avg
-                        name = names[app_id]
-                        flag = self._flag(country)
-                        if stars_only == 1:
-                            star = new_sum - written_sum
-                            if abs(star - round(star)) <= 0.25 and 1 <= round(star) <= 5:
-                                stars = "⭐" * round(star)
-                                pings.append(f"{stars} {name} — rating only {flag}".strip())
-                            else:
-                                pings.append(f"{name} — new rating, avg {avg:.1f} {flag}".strip())
+                        hold = (holds.get(app_id) or {}).get(country)
+                        if hold:
+                            hold["stars"] += stars_only
+                            hold["sum_delta"] += new_sum
+                            hold["written_sum"] += written_sum
+                            hold["n"] = n
+                            hold["avg"] = avg
+                            hold["star_guess"] = None
                         else:
-                            pings.append(f"{name} — {stars_only} new ratings "
-                                         f"(avg {acc_avg:.1f}→{avg:.1f}) {flag}".strip())
+                            guess = None
+                            if stars_only == 1:
+                                star = new_sum - written_sum
+                                if abs(star - round(star)) <= 0.25 and 1 <= round(star) <= 5:
+                                    guess = round(star)
+                            holds.setdefault(app_id, {})[country] = {
+                                "stars": stars_only,
+                                "sum_delta": new_sum,
+                                "written_sum": written_sum,
+                                "n": n,
+                                "avg": avg,
+                                "acc_avg": acc_avg,
+                                "star_guess": guess,
+                                "seen_at": time.time(),
+                            }
                         highs[app_id][country] = [n, avg * n, 0]
+        now = time.time()
+        for app_id, terr_holds in list(holds.items()):
+            name = names.get(app_id)
+            if name is None:
+                holds.pop(app_id, None)
+                dirty = True
+                continue
+            for country, hold in list(terr_holds.items()):
+                if now - hold["seen_at"] < hold_seconds:
+                    continue
+                flag = self._flag(country)
+                stars = hold["stars"]
+                if stars == 1 and hold.get("star_guess"):
+                    pings.append(f"{'⭐' * hold['star_guess']} {name} — rating only {flag}".strip())
+                elif stars == 1:
+                    pings.append(f"{name} — new rating, avg {hold['avg']:.1f} {flag}".strip())
+                else:
+                    pings.append(f"{name} — {stars} new ratings "
+                                 f"(avg {hold['acc_avg']:.1f}→{hold['avg']:.1f}) {flag}".strip())
+                terr_holds.pop(country, None)
+                dirty = True
+            if not terr_holds:
+                holds.pop(app_id, None)
         if dirty:
             save_state(self.state)
         if pings:
-            for chat_id in self.chat_ids:
-                for chunk in self._chunks("\n".join(pings)):
-                    self.send(chunk, chat_id=chat_id)
+            self.broadcast("\n".join(pings))
             log(f"rating pings: {len(pings)}")
 
     # ------------------------------------------------------------------ loop
@@ -1142,11 +1260,12 @@ class StoreBot:
                 continue
             delta = v - b["value"]
             suppress = (self.state.get("hook_suppress") or {}).get(p["name"], 0)
-            if suppress > time.time():
+            if suppress > time.time() or p["name"] in self.state.get("hook_seen", {}):
                 b["value"] = v
                 dirty = True
             elif delta > 0.004:
                 pings.append(self._celebrate(p["name"], delta))
+                self.state.setdefault("fallback_sent", {})[p["name"]] = time.time()
                 b["value"] = v
                 dirty = True
             elif delta < -0.004:
@@ -1166,8 +1285,7 @@ class StoreBot:
             save_state(self.state)
         if pings:
             text = "\n".join(pings)
-            for chat_id in self.chat_ids:
-                self.send(text, chat_id=chat_id)
+            self.broadcast(text)
             log(f"revenue ping: {'; '.join(pings)}")
 
     def _app_monetizes(self, app_id):
@@ -1233,8 +1351,7 @@ class StoreBot:
         if not unwired and not silent:
             return
         text = self._coverage_text(unwired, silent)
-        for chat_id in self.chat_ids:
-            self.send(text, chat_id=chat_id)
+        self.broadcast(text)
         log(f"coverage gaps: {text}")
 
     def run_forever(self):
@@ -1305,8 +1422,7 @@ class StoreBot:
         save_state(self.state)
         if pings:
             text = "\n".join(pings)
-            for chat_id in self.chat_ids:
-                self.send(text, chat_id=chat_id)
+            self.broadcast(text)
             log(f"appstore ping: {'; '.join(pings)}")
 
     def _drain_backlog(self):

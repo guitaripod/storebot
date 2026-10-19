@@ -14,9 +14,10 @@ tags:
 🌱 🔁 🇺🇸 Helia: Solar Coach · Pro (Monthly): +$9.99
 ```
 
-A 60s revenue-metric poll stays as fallback (app-level deltas only, no
-detail) and suppresses itself for 30 min around webhook deliveries so nothing
-double-pings. Refunds are tracked silently.
+A 60s revenue-metric poll stays as the fallback for projects that have never
+delivered a webhook. Once a project is proven live, app-level deltas are
+absorbed silently; after a fallback ping, matching hook pings are suppressed
+for 30 min so the first sale cannot ping twice. Refunds are tracked silently.
 
 **Paid-app sales** (invisible to RevenueCat, e.g. SForesight): App Store sales
 report checked once a day (default 09:00); pings only when a paid download
@@ -32,7 +33,9 @@ count wobbles (stale caches, Apple re-tallies), so counts are diffed against
 a high-water baseline: a lower read is absorbed and logged, never re-pinged.
 On upgrade from a pre-watermark state, each watermark seeds provisionally:
 the first read above the old count is held one sweep (unchanged read
-confirms it) so history never replays.
+confirms it) so history never replays. Stars-only ratings now wait two review
+cycles plus five minutes; a written review that surfaces in that window
+cancels one pending rating instead of arriving after it.
 
 **App Store sales without RevenueCat** (Master of Flags, Master of Inventory,
 PixiePocket, Tailscode): Apple's own App Store Server Notifications V2, posted
@@ -42,6 +45,11 @@ Server URL** to that address (App Store Connect → App Information → App Stor
 Server Notifications, version 2) — there is no API for it. Product names come
 from the app's ASC in-app purchases, and once an app has delivered one
 notification the daily sweep stops reporting its sales a day later.
+
+**No double pings**: RevenueCat and Apple notifications are collapsed by App
+Store transaction id, the revenue fallback defers to proven webhooks, and
+ambiguous Telegram send timeouts are never retried. A second storebot process
+refuses to start.
 
 **Coverage audit**: every 6h storebot compares its RevenueCat projects
 against the App Store apps that actually sell something (any IAP or
