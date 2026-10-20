@@ -1,6 +1,7 @@
 # storebot
 
-Telegram bot that tells Marcus the moment a sale lands. Nothing else.
+Telegram bot that tells Marcus the moment a sale lands, and writes the local
+activity feed for rc-tui.
 
 **RevenueCat sales** — per-sale detail via the RC webhook relay
 (`storebot-hook`, a Cloudflare Worker): product, price, buyer's country, plus
@@ -56,6 +57,13 @@ against the App Store apps that actually sell something (any IAP or
 subscription group) and pings the gaps — apps with no RC project, and RC
 projects that earn but whose webhook has never fired. It re-pings only when
 the gap set changes. `/coverage` runs it on demand.
+
+**Activity feed**: writes `~/.local/state/storebot/feed.json` (mode 600) and a
+60-second `feed.alive` heartbeat for rc-tui. It contains the same accepted sales,
+reviews and rating-only events, including entries whose Telegram delivery failed;
+`/off` mutes Telegram but does not stop the feed. On first creation it seeds up
+to 28 days of written reviews as `backfilled` history. rc-tui reads this file
+locally and makes no additional API calls.
 
 Commands: `/status`, `/coverage`, `/on`, `/off`, `/help`.
 

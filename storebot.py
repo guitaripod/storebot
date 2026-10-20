@@ -58,6 +58,7 @@ import base64
 import csv
 import fcntl
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -91,6 +92,12 @@ TG_MAX_LEN = 4000
 FALLBACK_GRACE_SECONDS = 1800
 SALES_SEEN_SECONDS = 90 * 24 * 3600
 SALES_SEEN_MAX = 5000
+FEED_FILE = LOG_DIR / "feed.json"
+FEED_ALIVE = LOG_DIR / "feed.alive"
+FEED_MAX = 500
+FEED_SEEN_SECONDS = 90 * 24 * 3600
+FEED_SEEN_MAX = 5000
+FEED_VERSION = 1
 
 APP_EMOJI = {
     "solar beam": ["☀️", "🔆"],
@@ -285,6 +292,9 @@ class StoreBot:
         self._apps_cache = None
         self._ever_sold_seeded = False
         self._last_coverage = 0.0
+        self._feed_entries = []
+        self._feed_seen = {}
+        self._feed_last_heartbeat = 0.0
 
     def run(self):
         if "--selftest" in sys.argv:
@@ -691,7 +701,7 @@ class StoreBot:
                 return True
         return False
 
-    def _asc_money_pings(self, rows):
+    def _asc_money_pings(self, rows, feed_entries=None, report_day=None):
         """Ping lines for every revenue row in a SALES report that storebot's
         RevenueCat path cannot see: all paid-app downloads plus IAP/subscription
         rows of apps without an RC project. IAP rows are attributed to their
@@ -721,7 +731,11 @@ class StoreBot:
             label = f"{app_name} · {title}" if is_iap and title != app_name else app_name
             flag = self._flag(row.get("Country Code"))
             cur = (row.get("Currency of Proceeds") or "").strip() or "$"
-            pings.add(f"📦 {label}: +{proceeds:,.2f} {cur}" + (f" {flag}" if flag else ""))
+            line = f"📦 {label}: +{proceeds:,.2f} {cur}" + (f" {flag}" if flag else "")
+            pings.add(line)
+            if feed_entries is not None:
+                feed_entries.append(self._feed_appstore(
+                    row, app_name, label, proceeds, cur, flag, report_day or "?"))
         return sorted(pings)
 
     def _status_text(self):
@@ -832,6 +846,278 @@ class StoreBot:
         log(f"apple event for unknown bundle {bundle_id!r}", "WARN")
         return None
 
+    def _feed_appstore(self, row, app_name, label, proceeds, currency, flag, report_day):
+        now = int(time.time() * 1000)
+        row_key = "|".join(str(row.get(key) or "") for key in (
+            "Order Number", "Order #", "SKU", "Parent Identifier", "Title",
+            "Country Code", "Quantity", "Developer Proceeds", "Currency of Proceeds",
+        ))
+        digest = hashlib.sha1((report_day + "|" + row_key).encode()).hexdigest()[:16]
+        return {
+            "id": f"sale:appstore:{report_day}:{digest}",
+            "kind": "purchase",
+            "at": now,
+            "received_at": now,
+            "app": app_name,
+            "project": app_name,
+            "project_id": "",
+            "app_id": "",
+            "country": self._feed_country(row.get("Country Code")),
+            "source": "app_store_sales",
+            "text": self._feed_one_line(
+                f"📦 {label}: +{proceeds:,.2f} {currency}" + (f" {flag}" if flag else "")
+            ),
+            "backfilled": False,
+            "purchase": {
+                "amount": float(proceeds),
+                "currency": str(currency or "").strip(),
+                "product": self._feed_one_line(row.get("Title"), 120),
+                "product_id": str(row.get("SKU") or ""),
+                "event": "purchase",
+                "environment": "production",
+                "first_ever": False,
+                "first_today": False,
+                "estimated": False,
+                "transaction_id": "",
+            },
+        }
+
+    def _load_feed(self):
+        self._feed_entries = []
+        self._feed_seen = self.state.setdefault("feed_seen", {})
+        try:
+            data = json.loads(FEED_FILE.read_text())
+            if int(data.get("version") or 0) > FEED_VERSION:
+                log(f"feed version {data.get('version')} is newer; not loading", "WARN")
+                return
+            entries = [entry for entry in (data.get("entries") or [])
+                       if isinstance(entry, dict) and entry.get("id")]
+            entries.sort(key=lambda entry: (int(entry.get("at") or 0),
+                                             int(entry.get("received_at") or 0),
+                                             str(entry.get("id"))),
+                         reverse=True)
+            seen = set()
+            for entry in entries:
+                key = str(entry["id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                self._feed_entries.append(entry)
+                self._feed_seen[key] = max(
+                    float(self._feed_seen.get(key) or 0),
+                    float(entry.get("received_at") or 0) / 1000,
+                )
+            self._feed_entries = self._feed_entries[:FEED_MAX]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as e:
+            log(f"feed read: {e}", "WARN")
+
+    @staticmethod
+    def _feed_clean(value, limit=2000):
+        text = str(value or "")
+        text = "".join(ch if ch == "\n" or ch.isprintable() else " " for ch in text)
+        text = text.replace("\r", "\n")
+        return text[:limit]
+
+    @staticmethod
+    def _feed_one_line(value, limit=2000):
+        return re.sub(r"\s+", " ", StoreBot._feed_clean(value, limit)).strip()
+
+    @staticmethod
+    def _feed_country(value):
+        code = (value or "").strip().upper()
+        if len(code) == 3:
+            code = TERRITORY_ALPHA2.get(code, code[:2])
+        return code[:2].upper()
+
+    @staticmethod
+    def _feed_iso_ms(value):
+        if not value:
+            return int(time.time() * 1000)
+        try:
+            return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+        except (ValueError, TypeError):
+            return int(time.time() * 1000)
+
+    def _feed_write(self):
+        payload = {
+            "version": FEED_VERSION,
+            "written_at": int(time.time() * 1000),
+            "entries": self._feed_entries[:FEED_MAX],
+        }
+        try:
+            FEED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = FEED_FILE.with_name(FEED_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            os.chmod(tmp, 0o600)
+            tmp.replace(FEED_FILE)
+        except OSError as e:
+            log(f"feed write: {e}", "ERROR")
+
+    def _feed_alive_write(self):
+        try:
+            ALIVE_TMP = FEED_ALIVE.with_name(FEED_ALIVE.name + ".tmp")
+            ALIVE_TMP.write_text(str(int(time.time() * 1000)))
+            ALIVE_TMP.replace(FEED_ALIVE)
+            self._feed_last_heartbeat = time.time()
+        except OSError as e:
+            log(f"feed heartbeat: {e}", "WARN")
+
+    def _feed_heartbeat(self, force=False):
+        if force or time.time() - self._feed_last_heartbeat >= 60:
+            self._feed_alive_write()
+
+    def _feed_prune_seen(self):
+        cutoff = time.time() - FEED_SEEN_SECONDS
+        for key, stamp in list(self._feed_seen.items()):
+            if float(stamp or 0) < cutoff:
+                self._feed_seen.pop(key, None)
+        if len(self._feed_seen) > FEED_SEEN_MAX:
+            excess = len(self._feed_seen) - FEED_SEEN_MAX
+            for key, _ in sorted(self._feed_seen.items(), key=lambda item: item[1])[:excess]:
+                self._feed_seen.pop(key, None)
+
+    def _feed_emit(self, entries):
+        if not entries:
+            return
+        now = time.time()
+        fresh = []
+        for entry in entries:
+            key = str(entry.get("id") or "")
+            if not key or key in self._feed_seen:
+                continue
+            self._feed_seen[key] = now
+            fresh.append(entry)
+        if not fresh:
+            return
+        self._feed_entries = sorted(fresh + self._feed_entries,
+                                    key=lambda entry: (int(entry.get("at") or 0),
+                                                       int(entry.get("received_at") or 0),
+                                                       str(entry.get("id"))),
+                                    reverse=True)[:FEED_MAX]
+        self._feed_prune_seen()
+        self._feed_write()
+
+    @staticmethod
+    def _feed_purchase_event(event):
+        kind = event.get("type") or ""
+        if kind == "RENEWAL":
+            return "trial_conversion" if event.get("is_trial_conversion") else "renewal"
+        if kind == "NON_RENEWING_PURCHASE":
+            return "purchase"
+        return "new"
+
+    def _feed_purchase(self, project, event, line, event_id, source,
+                       first_ever=False, first_today=False):
+        now = int(time.time() * 1000)
+        event_time = int(event.get("event_timestamp_ms") or event.get("purchased_at_ms") or now)
+        products = self._products(project)
+        product_id = str(event.get("product_id") or "")
+        product = products.get(product_id) or products.get(product_id.lower()) or ""
+        key = self._sale_key(event, event_id)
+        return {
+            "id": f"sale:{key}",
+            "kind": "purchase",
+            "at": event_time,
+            "received_at": now,
+            "app": project.get("name") or "?",
+            "project": project.get("name") or "?",
+            "project_id": project.get("project_id") or "",
+            "app_id": str(project.get("app_id") or ""),
+            "country": self._feed_country(event.get("country_code")),
+            "source": source,
+            "text": self._feed_one_line(line),
+            "backfilled": False,
+            "purchase": {
+                "amount": float(event.get("price_in_purchased_currency") or event.get("price") or 0),
+                "currency": str(event.get("currency") or ""),
+                "product": self._feed_one_line(product, 120),
+                "product_id": product_id,
+                "event": self._feed_purchase_event(event),
+                "environment": str(event.get("environment") or "").lower(),
+                "first_ever": bool(first_ever),
+                "first_today": bool(first_today),
+                "estimated": False,
+                "transaction_id": str(event.get("transaction_id") or ""),
+            },
+        }
+
+    def _feed_review(self, app_id, review_id, name, attrs, line, backfilled=False):
+        now = int(time.time() * 1000)
+        return {
+            "id": f"review:{review_id}",
+            "kind": "review",
+            "at": self._feed_iso_ms(attrs.get("createdDate")),
+            "received_at": now,
+            "app": name,
+            "project": name,
+            "project_id": "",
+            "app_id": str(app_id),
+            "country": self._feed_country(attrs.get("territory")),
+            "source": "asc_reviews",
+            "text": self._feed_one_line(line),
+            "backfilled": bool(backfilled),
+            "review": {
+                "stars": int(attrs.get("rating") or 1),
+                "title": self._feed_one_line(attrs.get("title"), 200),
+                "body": self._feed_clean(attrs.get("body"), 2000),
+                "author": self._feed_one_line(attrs.get("reviewerNickname"), 80),
+            },
+        }
+
+    def _feed_rating(self, app_id, name, country, hold, line):
+        now = int(time.time() * 1000)
+        return {
+            "id": f"rating:{app_id}:{country}:{hold.get('n')}",
+            "kind": "rating",
+            "at": int(float(hold.get("seen_at") or time.time()) * 1000),
+            "received_at": now,
+            "app": name,
+            "project": name,
+            "project_id": "",
+            "app_id": str(app_id),
+            "country": self._feed_country(country),
+            "source": "itunes",
+            "text": self._feed_one_line(line),
+            "backfilled": False,
+            "rating": {
+                "stars": hold.get("star_guess"),
+                "count": int(hold.get("stars") or 0),
+                "average": float(hold.get("avg") or 0),
+            },
+        }
+
+    def _feed_fallback(self, project, delta, line):
+        now = int(time.time() * 1000)
+        day = datetime.now(timezone.utc).date().isoformat()
+        return {
+            "id": f"sale:fallback:{project['name']}:{day}:{now}:{delta:.4f}",
+            "kind": "purchase",
+            "at": now,
+            "received_at": now,
+            "app": project["name"],
+            "project": project["name"],
+            "project_id": project.get("project_id") or "",
+            "app_id": "",
+            "country": "",
+            "source": "revenuecat_fallback",
+            "text": self._feed_one_line(line),
+            "backfilled": False,
+            "purchase": {
+                "amount": float(delta),
+                "currency": "USD",
+                "product": "",
+                "product_id": "",
+                "event": "revenue",
+                "environment": "production",
+                "first_ever": False,
+                "first_today": False,
+                "estimated": True,
+                "transaction_id": "",
+            },
+        }
+
     def _seed_ever_sold(self):
         """Mark projects that already have revenue so their next sale is not
         mistaken for a first-ever one."""
@@ -915,8 +1201,6 @@ class StoreBot:
         if now - self._last_hook < self.hook_seconds or not self.hook_url:
             return
         self._last_hook = now
-        if not self.state.get("alerts_enabled", True):
-            return
         if not self._ever_sold_seeded:
             self._seed_ever_sold()
             self._ever_sold_seeded = True
@@ -933,6 +1217,7 @@ class StoreBot:
         processed = self.state.setdefault("seen_events", [])
         seen = set(processed)
         pings = []
+        feed_entries = []
         affected = set()
         fallback = self.state.setdefault("fallback_sent", {})
         for entry in events:
@@ -964,18 +1249,30 @@ class StoreBot:
             if fallback.get(project["name"], 0) + FALLBACK_GRACE_SECONDS > now:
                 log(f"hook sale {key} already covered by revenue fallback; skipping", "INFO")
                 continue
+            first_ever = not (self.state.get("ever_sold") or {}).get(project["name"])
+            sale_day = datetime.fromtimestamp(
+                (event.get("event_timestamp_ms") or 0) / 1000, tz=timezone.utc
+            ).date().isoformat()
+            first_today = (self.state.get("sale_days") or {}).get(project["name"]) != sale_day
             line = self._hook_line(project, event)
             if line:
                 pings.append(line)
                 affected.add(project["name"])
+                feed_entries.append(self._feed_purchase(
+                    project, event, line, event_id,
+                    "app_store" if project_name.startswith("apple:") else "revenuecat",
+                    first_ever=first_ever, first_today=first_today,
+                ))
         self.state["seen_events"] = (processed + list(seen - set(processed)))[-1000:]
+        if feed_entries:
+            self._feed_emit(feed_entries)
         save_state(self.state)
         if affected:
             suppress = self.state.setdefault("hook_suppress", {})
             for name in affected:
                 suppress[name] = now + 1800
             save_state(self.state)
-        if pings:
+        if pings and self.state.get("alerts_enabled", True):
             text = "\n".join(pings)
             self.broadcast(text)
             log(f"hook pings: {'; '.join(pings)}")
@@ -987,6 +1284,18 @@ class StoreBot:
             log(f"hook ack: {e}", "WARN")
 
     # ----------------------------------------------------------------- reviews
+
+    @staticmethod
+    def _review_line(name, attrs):
+        stars = "⭐" * (attrs.get("rating") or 1)
+        title = (attrs.get("title") or "").strip()
+        body = (attrs.get("body") or "").strip()
+        text = (title or body).replace("\n", " ")[:120]
+        nick = (attrs.get("reviewerNickname") or "user").strip()
+        flag = StoreBot._flag(attrs.get("territory"))
+        if text:
+            return f"{stars} {name} — “{text}” — {nick} {flag}".strip()
+        return f"{stars} {name} — {nick} {flag}".strip()
 
     def _tick_reviews(self):
         """Poll App Store Connect customerReviews and ping every new written
@@ -1002,8 +1311,6 @@ class StoreBot:
         if now - self._last_review < self.review_seconds:
             return
         self._last_review = now
-        if not self.state.get("alerts_enabled", True):
-            return
         try:
             self._ensure_apps()
         except requests.RequestException as e:
@@ -1012,6 +1319,10 @@ class StoreBot:
         seen = self.state.setdefault("reviews_seen", {})
         pending = self.state.setdefault("review_pending", {})
         pings = []
+        feed_entries = []
+        seed_entries = []
+        seed_needed = not self.state.get("feed_seeded")
+        seed_cutoff = int((time.time() - 28 * 86400) * 1000)
         dirty = False
         for app in self._apps_cache["apps"]:
             app_id = app["id"]
@@ -1023,6 +1334,21 @@ class StoreBot:
                 log(f"reviews {name}: {e}", "WARN")
                 continue
             reviews = data.get("data") or []
+            if seed_needed:
+                for rv in reviews:
+                    attrs = rv.get("attributes") or {}
+                    if self._feed_iso_ms(attrs.get("createdDate")) < seed_cutoff:
+                        continue
+                    line = self._review_line(name, attrs)
+                    seed_entries.append(self._feed_review(
+                        app_id, rv.get("id"), name, attrs, line, backfilled=True))
+                seen.setdefault(app_id, [])
+                for rv in reviews:
+                    rid = rv.get("id")
+                    if rid and rid not in seen[app_id]:
+                        seen[app_id].append(rid)
+                seen[app_id] = seen[app_id][-200:]
+                dirty = True
             known = set(seen.get(app_id) or [])
             fresh = [rv for rv in reviews if rv["id"] not in known]
             if app_id not in seen:
@@ -1051,19 +1377,21 @@ class StoreBot:
                     if not holds.get(app_id):
                         holds.pop(app_id, None)
                     dirty = True
-                stars = "⭐" * (attrs.get("rating") or 1)
-                title = (attrs.get("title") or "").strip()
-                body = (attrs.get("body") or "").strip()
-                text = (title or body).replace("\n", " ")[:120]
-                nick = (attrs.get("reviewerNickname") or "user").strip()
-                flag = self._flag(terr)
-                if text:
-                    pings.append(f"{stars} {name} — “{text}” — {nick} {flag}".strip())
-                else:
-                    pings.append(f"{stars} {name} — {nick} {flag}".strip())
+                line = self._review_line(name, attrs)
+                pings.append(line)
+                feed_entries.append(self._feed_review(
+                    app_id, rv.get("id"), name, attrs, line))
+        if seed_needed:
+            self._feed_emit(seed_entries)
+            if not FEED_FILE.exists():
+                self._feed_write()
+            self.state["feed_seeded"] = True
+            dirty = True
+        if feed_entries:
+            self._feed_emit(feed_entries)
         if dirty:
             save_state(self.state)
-        if pings:
+        if pings and self.state.get("alerts_enabled", True):
             self.broadcast("\n".join(pings))
             log(f"review pings: {len(pings)}")
         self._sweep_ratings()
@@ -1104,6 +1432,7 @@ class StoreBot:
         terr_of = {v: k for k, v in TERRITORY_ALPHA2.items()}
         dirty = False
         pings = []
+        feed_entries = []
         def lookup(country):
             try:
                 r = requests.get("https://itunes.apple.com/lookup", timeout=30,
@@ -1218,15 +1547,31 @@ class StoreBot:
                 elif stars == 1:
                     pings.append(f"{name} — new rating, avg {hold['avg']:.1f} {flag}".strip())
                 else:
-                    pings.append(f"{name} — {stars} new ratings "
-                                 f"(avg {hold['acc_avg']:.1f}→{hold['avg']:.1f}) {flag}".strip())
+                    line = (f"{name} — {stars} new ratings "
+                            f"(avg {hold['acc_avg']:.1f}→{hold['avg']:.1f}) {flag}").strip()
+                    pings.append(line)
+                if stars == 1 and hold.get("star_guess"):
+                    feed_entries.append(self._feed_rating(
+                        app_id, name, country, hold,
+                        f"{'⭐' * hold['star_guess']} {name} — rating only {flag}".strip()))
+                elif stars == 1:
+                    feed_entries.append(self._feed_rating(
+                        app_id, name, country, hold,
+                        f"{name} — new rating, avg {hold['avg']:.1f} {flag}".strip()))
+                else:
+                    feed_entries.append(self._feed_rating(
+                        app_id, name, country, hold,
+                        f"{name} — {stars} new ratings "
+                        f"(avg {hold['acc_avg']:.1f}→{hold['avg']:.1f}) {flag}".strip()))
                 terr_holds.pop(country, None)
                 dirty = True
             if not terr_holds:
                 holds.pop(app_id, None)
+        if feed_entries:
+            self._feed_emit(feed_entries)
         if dirty:
             save_state(self.state)
-        if pings:
+        if pings and self.state.get("alerts_enabled", True):
             self.broadcast("\n".join(pings))
             log(f"rating pings: {len(pings)}")
 
@@ -1241,11 +1586,10 @@ class StoreBot:
         if now - self._last_poll < self.poll_seconds:
             return
         self._last_poll = now
-        if not self.state.get("alerts_enabled", True):
-            return
         utc_today = datetime.now(timezone.utc).date()
         baseline = self.state.setdefault("revenue_baseline", {})
         pings = []
+        feed_entries = []
         dirty = False
         total_today = 0.0
         for p in self._projects_ok():
@@ -1264,7 +1608,9 @@ class StoreBot:
                 b["value"] = v
                 dirty = True
             elif delta > 0.004:
-                pings.append(self._celebrate(p["name"], delta))
+                line = self._celebrate(p["name"], delta)
+                pings.append(line)
+                feed_entries.append(self._feed_fallback(p, delta, line))
                 self.state.setdefault("fallback_sent", {})[p["name"]] = time.time()
                 b["value"] = v
                 dirty = True
@@ -1281,9 +1627,11 @@ class StoreBot:
                 milestones["crossed"].append(threshold)
                 pings.append(line)
                 dirty = True
+        if feed_entries:
+            self._feed_emit(feed_entries)
         if dirty:
             save_state(self.state)
-        if pings:
+        if pings and self.state.get("alerts_enabled", True):
             text = "\n".join(pings)
             self.broadcast(text)
             log(f"revenue ping: {'; '.join(pings)}")
@@ -1361,8 +1709,10 @@ class StoreBot:
             log(f"setMyCommands: {e}", "WARN")
         if "update_offset" not in self.state:
             self._drain_backlog()
+        self._feed_heartbeat(force=True)
         log("storebot online")
         while True:
+            self._feed_heartbeat()
             for tick in (self._tick_hook, self._tick_revenue,
                          self._tick_appstore, self._tick_reviews,
                          self._tick_coverage):
@@ -1403,7 +1753,7 @@ class StoreBot:
         apps are suppressed so a sale never pings twice."""
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
-        if not self.state.get("alerts_enabled", True) or self.state.get("last_as_check") == today:
+        if self.state.get("last_as_check") == today:
             return
         if time.time() - getattr(self, "_last_as_try", 0.0) < 600:
             return
@@ -1417,10 +1767,13 @@ class StoreBot:
         except requests.RequestException as e:
             log(f"appstore check failed: {e}", "WARN")
             return
-        pings = self._asc_money_pings(rows)
+        feed_entries = []
+        pings = self._asc_money_pings(rows, feed_entries, today)
+        if feed_entries:
+            self._feed_emit(feed_entries)
         self.state["last_as_check"] = today
         save_state(self.state)
-        if pings:
+        if pings and self.state.get("alerts_enabled", True):
             text = "\n".join(pings)
             self.broadcast(text)
             log(f"appstore ping: {'; '.join(pings)}")
