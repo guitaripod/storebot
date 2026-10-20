@@ -1097,7 +1097,7 @@ class StoreBot:
         return {
             "id": f"rating-history:{app_id}",
             "kind": "rating",
-            "at": now,
+            "at": 0,
             "received_at": now,
             "app": name,
             "project": name,
@@ -1423,6 +1423,24 @@ class StoreBot:
             log(f"review pings: {len(pings)}")
         self._sweep_ratings()
         self._seed_rating_history()
+
+    def _fix_rating_history_times(self):
+        """Rating history is not a point event; keep its feed time unknown."""
+        if self.state.get("rating_history_times_fixed"):
+            return
+        changed = False
+        for entry in self._feed_entries:
+            if entry.get("kind") != "rating":
+                continue
+            if not (entry.get("rating") or {}).get("summary"):
+                continue
+            if entry.get("at") != 0:
+                entry["at"] = 0
+                changed = True
+        if changed:
+            self._feed_write()
+        self.state["rating_history_times_fixed"] = True
+        save_state(self.state)
 
     def _seed_rating_history(self):
         """One-time all-time rating totals for the feed, one card per app."""
@@ -1774,6 +1792,7 @@ class StoreBot:
         self._feed_heartbeat(force=True)
         self._backfill_appstore_feed()
         self._backfill_log_feed()
+        self._fix_rating_history_times()
         log("storebot online")
         while True:
             self._feed_heartbeat()
