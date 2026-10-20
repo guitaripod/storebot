@@ -8,10 +8,10 @@ if [ ! -f ~/.config/storebot/secrets.env ]; then
 STOREBOT_TOKEN=
 STOREBOT_CHAT_IDS=
 STOREBOT_DIGEST_HOUR=9
-STOREBOT_VENDOR=93803823
+STOREBOT_VENDOR=
 EOF
   chmod 600 ~/.config/storebot/secrets.env
-  echo "created ~/.config/storebot/secrets.env — fill STOREBOT_TOKEN (@BotFather) and STOREBOT_CHAT_IDS"
+  echo "created ~/.config/storebot/secrets.env — fill STOREBOT_TOKEN (@BotFather), STOREBOT_CHAT_IDS and STOREBOT_VENDOR"
 fi
 
 mkdir -p ~/.config/systemd/user
