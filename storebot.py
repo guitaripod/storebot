@@ -295,6 +295,7 @@ class StoreBot:
         self._feed_entries = []
         self._feed_seen = {}
         self._feed_last_heartbeat = 0.0
+        self._load_feed()
 
     def run(self):
         if "--selftest" in sys.argv:
@@ -701,7 +702,8 @@ class StoreBot:
                 return True
         return False
 
-    def _asc_money_pings(self, rows, feed_entries=None, report_day=None):
+    def _asc_money_pings(self, rows, feed_entries=None, report_day=None,
+                         backfill_at=None, backfilled=False, include_live=False):
         """Ping lines for every revenue row in a SALES report that storebot's
         RevenueCat path cannot see: all paid-app downloads plus IAP/subscription
         rows of apps without an RC project. IAP rows are attributed to their
@@ -726,7 +728,7 @@ class StoreBot:
             app_name = sku_map.get(parent) if parent else None
             is_iap = app_name is not None or ptype.startswith("IA")
             app_name = app_name or title
-            if is_iap and self._is_live_covered(app_name):
+            if is_iap and not include_live and self._is_live_covered(app_name):
                 continue
             label = f"{app_name} · {title}" if is_iap and title != app_name else app_name
             flag = self._flag(row.get("Country Code"))
@@ -735,7 +737,8 @@ class StoreBot:
             pings.add(line)
             if feed_entries is not None:
                 feed_entries.append(self._feed_appstore(
-                    row, app_name, label, proceeds, cur, flag, report_day or "?"))
+                    row, app_name, label, proceeds, cur, flag, report_day or "?",
+                    at_ms=backfill_at, backfilled=backfilled))
         return sorted(pings)
 
     def _status_text(self):
@@ -846,7 +849,8 @@ class StoreBot:
         log(f"apple event for unknown bundle {bundle_id!r}", "WARN")
         return None
 
-    def _feed_appstore(self, row, app_name, label, proceeds, currency, flag, report_day):
+    def _feed_appstore(self, row, app_name, label, proceeds, currency, flag, report_day,
+                       at_ms=None, backfilled=False):
         now = int(time.time() * 1000)
         row_key = "|".join(str(row.get(key) or "") for key in (
             "Order Number", "Order #", "SKU", "Parent Identifier", "Title",
@@ -856,7 +860,7 @@ class StoreBot:
         return {
             "id": f"sale:appstore:{report_day}:{digest}",
             "kind": "purchase",
-            "at": now,
+            "at": int(at_ms if at_ms is not None else now),
             "received_at": now,
             "app": app_name,
             "project": app_name,
@@ -867,7 +871,7 @@ class StoreBot:
             "text": self._feed_one_line(
                 f"📦 {label}: +{proceeds:,.2f} {currency}" + (f" {flag}" if flag else "")
             ),
-            "backfilled": False,
+            "backfilled": bool(backfilled),
             "purchase": {
                 "amount": float(proceeds),
                 "currency": str(currency or "").strip(),
@@ -1710,6 +1714,8 @@ class StoreBot:
         if "update_offset" not in self.state:
             self._drain_backlog()
         self._feed_heartbeat(force=True)
+        self._backfill_appstore_feed()
+        self._backfill_log_feed()
         log("storebot online")
         while True:
             self._feed_heartbeat()
@@ -1745,6 +1751,222 @@ class StoreBot:
                     except RuntimeError:
                         pass
 
+    def _backfill_appstore_feed(self):
+        """Seed recent App Store sales into the feed once, without Telegram."""
+        if self.state.get("feed_sales_seeded"):
+            return
+        try:
+            self._ensure_apps()
+        except requests.RequestException as e:
+            log(f"feed backfill apps: {e}", "WARN")
+            return
+        known = set()
+        for entry in self._feed_entries:
+            if entry.get("kind") != "purchase":
+                continue
+            try:
+                stamp = datetime.fromtimestamp(
+                    int(entry.get("at") or 0) / 1000, tz=timezone.utc
+                ).date().isoformat()
+                purchase = entry.get("purchase") or {}
+                known.add((
+                    entry.get("app"), entry.get("country"),
+                    round(float(purchase.get("amount") or 0), 2), stamp,
+                ))
+            except (TypeError, ValueError):
+                continue
+        entries = []
+        today = date.today()
+        for offset in range(1, 15):
+            day = today - timedelta(days=offset)
+            try:
+                rows = self.asc_sales(day)
+            except requests.RequestException as e:
+                log(f"feed backfill sales {day}: {e}", "WARN")
+                continue
+            if not rows:
+                continue
+            day_at = int(datetime(day.year, day.month, day.day, 12,
+                                  tzinfo=timezone.utc).timestamp() * 1000)
+            fresh = []
+            self._asc_money_pings(
+                rows, fresh, day.isoformat(),
+                backfill_at=day_at, backfilled=True, include_live=True,
+            )
+            for entry in fresh:
+                purchase = entry.get("purchase") or {}
+                signature = (
+                    entry.get("app"), entry.get("country"),
+                    round(float(purchase.get("amount") or 0), 2), day.isoformat(),
+                )
+                if signature in known:
+                    continue
+                entries.append(entry)
+        if entries:
+            self._feed_emit(entries)
+        if not FEED_FILE.exists():
+            self._feed_write()
+        self.state["feed_sales_seeded"] = True
+        save_state(self.state)
+        log(f"feed backfill: {len(entries)} App Store sale rows")
+
+    @staticmethod
+    def _log_flag_country(text):
+        match = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", text)
+        if not match:
+            return ""
+        return "".join(chr(ord(ch) - 0x1F1E6 + ord("A")) for ch in match.group(0))
+
+    @staticmethod
+    def _log_money(token, country):
+        token = token.strip().lstrip("+").replace(",", "")
+        code = ""
+        for prefix, currency in (
+            ("HK$", "HKD"), ("NZ$", "NZD"), ("A$", "AUD"), ("C$", "CAD"),
+            ("MX$", "MXN"), ("R$", "BRL"), ("CO$", "COP"), ("S$", "SGD"),
+            ("€", "EUR"), ("£", "GBP"), ("$", "USD"), ("¥", "JPY"),
+            ("₹", "INR"), ("₩", "KRW"), ("₺", "TRY"), ("zł", "PLN"),
+            ("Kč", "CZK"), ("lei", "RON"), ("₴", "UAH"), ("RM", "MYR"),
+            ("kr", "NOK"), ("Fr.", "CHF"),
+        ):
+            if token.startswith(prefix):
+                code = currency
+                token = token[len(prefix):]
+                break
+        if code == "JPY" and country == "CN":
+            code = "CNY"
+        if code == "NOK":
+            code = {"NO": "NOK", "SE": "SEK", "DK": "DKK"}.get(country, "NOK")
+        match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", token)
+        if not match:
+            return None
+        return float(match.group(0)), code or "USD"
+
+    def _log_known_app(self, app):
+        key = self._name_key(app)
+        if not key:
+            return False
+        names = [p.get("name", "") for p in self._projects_ok()]
+        names += [a.get("attributes", {}).get("name", "")
+                  for a in (self._apps_cache or {}).get("apps") or []]
+        for name in names:
+            other = self._name_key(name)
+            if not other:
+                continue
+            if key == other or (len(other) >= 4 and (other in key or key in other)):
+                return True
+            if len(self._brand(name)) >= 4 and self._brand(name) == self._brand(app):
+                return True
+        return False
+
+    def _backfill_log_feed(self):
+        """Bootstrap purchases logged today/yesterday before the feed existed."""
+        if self.state.get("feed_logs_seeded"):
+            return
+        try:
+            self._ensure_apps()
+        except requests.RequestException as e:
+            log(f"feed log backfill apps: {e}", "WARN")
+            return
+        known = set()
+        for entry in self._feed_entries:
+            if entry.get("kind") != "purchase":
+                continue
+            purchase = entry.get("purchase") or {}
+            day = datetime.fromtimestamp(
+                int(entry.get("at") or 0) / 1000, tz=timezone.utc
+            ).date().isoformat()
+            known.add((self._name_key(entry.get("app", "")), entry.get("country", ""),
+                       round(float(purchase.get("amount") or 0), 2), day))
+        seen = set()
+        entries = []
+        today = date.today()
+        for offset in (0, 1):
+            day = today - timedelta(days=offset)
+            path = LOG_DIR / f"run-{day.isoformat()}.log"
+            try:
+                lines = path.read_text().splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if "hook pings: " not in line:
+                    continue
+                match = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]", line)
+                try:
+                    stamp = datetime.strptime(
+                        match.group(1) if match else day.isoformat() + " 12:00:00",
+                        "%Y-%m-%d %H:%M:%S",
+                    ).timestamp() * 1000
+                except ValueError:
+                    stamp = datetime(day.year, day.month, day.day, 12,
+                                     tzinfo=timezone.utc).timestamp() * 1000
+                body = line.split("hook pings: ", 1)[1]
+                for chunk in body.split("; "):
+                    chunk = chunk.strip()
+                    country = self._log_flag_country(chunk)
+                    money_match = re.search(r"\+\s*([^\s]+)\s*$", chunk)
+                    if not money_match:
+                        continue
+                    parsed = self._log_money(money_match.group(1), country)
+                    if not parsed:
+                        continue
+                    amount, currency = parsed
+                    before = chunk[:money_match.start()].rstrip(": ").strip()
+                    flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", before)
+                    if flag:
+                        before = before[flag.end():]
+                    before = re.sub(r"^[^A-Za-z0-9]+", "", before).strip()
+                    if not before:
+                        continue
+                    app, _, product = before.partition(" · ")
+                    app = app.strip()
+                    product = product.strip()
+                    if not self._log_known_app(app):
+                        continue
+                    signature = (self._name_key(app), country, round(amount, 2),
+                                 day.isoformat(), self._name_key(product or app))
+                    if signature in seen or signature[:4] in known:
+                        continue
+                    seen.add(signature)
+                    event = "trial_conversion" if "🌱" in chunk else (
+                        "renewal" if "🔁" in chunk else "new")
+                    text = chunk
+                    entries.append({
+                        "id": "sale:log:" + hashlib.sha1(
+                            "|".join(map(str, signature)).encode()
+                        ).hexdigest()[:16],
+                        "kind": "purchase",
+                        "at": int(stamp),
+                        "received_at": int(time.time() * 1000),
+                        "app": app,
+                        "project": app,
+                        "project_id": "",
+                        "app_id": "",
+                        "country": country,
+                        "source": "storebot_log",
+                        "text": self._feed_one_line(text),
+                        "backfilled": True,
+                        "purchase": {
+                            "amount": amount,
+                            "currency": currency,
+                            "product": self._feed_one_line(product, 120),
+                            "product_id": "",
+                            "event": event,
+                            "environment": "production",
+                            "first_ever": "first-ever" in chunk,
+                            "first_today": "1st today" in chunk,
+                            "estimated": False,
+                            "transaction_id": "",
+                        },
+                    })
+        if entries:
+            self._feed_emit(entries)
+        if not FEED_FILE.exists():
+            self._feed_write()
+        self.state["feed_logs_seeded"] = True
+        save_state(self.state)
+        log(f"feed log backfill: {len(entries)} purchases")
+
     def _tick_appstore(self):
         """Daily sweep of Apple's SALES report — catches every revenue row the
         RevenueCat path can't see (paid downloads + IAPs/subs of apps without
@@ -1768,7 +1990,8 @@ class StoreBot:
             log(f"appstore check failed: {e}", "WARN")
             return
         feed_entries = []
-        pings = self._asc_money_pings(rows, feed_entries, today)
+        report_day = (date.today() - timedelta(days=1)).isoformat()
+        pings = self._asc_money_pings(rows, feed_entries, report_day)
         if feed_entries:
             self._feed_emit(feed_entries)
         self.state["last_as_check"] = today

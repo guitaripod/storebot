@@ -62,8 +62,9 @@ the gap set changes. `/coverage` runs it on demand.
 60-second `feed.alive` heartbeat for rc-tui. It contains the same accepted sales,
 reviews and rating-only events, including entries whose Telegram delivery failed;
 `/off` mutes Telegram but does not stop the feed. On first creation it seeds up
-to 28 days of written reviews as `backfilled` history. rc-tui reads this file
-locally and makes no additional API calls.
+to 28 days of written reviews, 14 days of paid App Store sales rows, and the
+current two days of hook-log purchases as `backfilled` history. rc-tui reads
+this file locally and makes no additional API calls.
 
 Commands: `/status`, `/coverage`, `/on`, `/off`, `/help`.
 
