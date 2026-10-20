@@ -61,10 +61,12 @@ the gap set changes. `/coverage` runs it on demand.
 **Activity feed**: writes `~/.local/state/storebot/feed.json` (mode 600) and a
 60-second `feed.alive` heartbeat for rc-tui. It contains the same accepted sales,
 reviews and rating-only events, including entries whose Telegram delivery failed;
-`/off` mutes Telegram but does not stop the feed. On first creation it seeds up
-to 28 days of written reviews, 14 days of paid App Store sales rows, and the
-current two days of hook-log purchases as `backfilled` history. rc-tui reads
-this file locally and makes no additional API calls.
+`/off` mutes Telegram but does not stop the feed. On first creation it seeds all
+available written reviews, one all-time rating total per app, 14 days of paid
+App Store sales rows, and the current two days of hook-log purchases as
+`backfilled` history. Stars-only ratings are aggregate storefront counts, not
+individual Apple events, so they appear as an app total. rc-tui reads this file
+locally and makes no additional API calls.
 
 Commands: `/status`, `/coverage`, `/on`, `/off`, `/help`.
 

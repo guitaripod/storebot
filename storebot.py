@@ -1092,6 +1092,30 @@ class StoreBot:
             },
         }
 
+    def _feed_rating_history(self, app_id, name, total, average):
+        now = int(time.time() * 1000)
+        return {
+            "id": f"rating-history:{app_id}",
+            "kind": "rating",
+            "at": now,
+            "received_at": now,
+            "app": name,
+            "project": name,
+            "project_id": "",
+            "app_id": str(app_id),
+            "country": "",
+            "source": "itunes_history",
+            "text": self._feed_one_line(
+                f"{name} — all-time ratings: {total} · average {average:.1f}"),
+            "backfilled": True,
+            "rating": {
+                "stars": None,
+                "count": int(total),
+                "average": float(average),
+                "summary": True,
+            },
+        }
+
     def _feed_fallback(self, project, delta, line):
         now = int(time.time() * 1000)
         day = datetime.now(timezone.utc).date().isoformat()
@@ -1326,23 +1350,21 @@ class StoreBot:
         feed_entries = []
         seed_entries = []
         seed_needed = not self.state.get("feed_seeded")
-        seed_cutoff = int((time.time() - 28 * 86400) * 1000)
+        history_needed = not self.state.get("feed_reviews_seeded")
         dirty = False
         for app in self._apps_cache["apps"]:
             app_id = app["id"]
             name = app["attributes"].get("name", "?")
             try:
                 data = self.asc_get(
-                    f"/v1/apps/{app_id}/customerReviews?limit=50&sort=-createdDate")
+                    f"/v1/apps/{app_id}/customerReviews?limit=200&sort=-createdDate")
             except requests.RequestException as e:
                 log(f"reviews {name}: {e}", "WARN")
                 continue
             reviews = data.get("data") or []
-            if seed_needed:
+            if seed_needed or history_needed:
                 for rv in reviews:
                     attrs = rv.get("attributes") or {}
-                    if self._feed_iso_ms(attrs.get("createdDate")) < seed_cutoff:
-                        continue
                     line = self._review_line(name, attrs)
                     seed_entries.append(self._feed_review(
                         app_id, rv.get("id"), name, attrs, line, backfilled=True))
@@ -1385,11 +1407,12 @@ class StoreBot:
                 pings.append(line)
                 feed_entries.append(self._feed_review(
                     app_id, rv.get("id"), name, attrs, line))
-        if seed_needed:
+        if seed_needed or history_needed:
             self._feed_emit(seed_entries)
             if not FEED_FILE.exists():
                 self._feed_write()
             self.state["feed_seeded"] = True
+            self.state["feed_reviews_seeded"] = True
             dirty = True
         if feed_entries:
             self._feed_emit(feed_entries)
@@ -1399,6 +1422,41 @@ class StoreBot:
             self.broadcast("\n".join(pings))
             log(f"review pings: {len(pings)}")
         self._sweep_ratings()
+        self._seed_rating_history()
+
+    def _seed_rating_history(self):
+        """One-time all-time rating totals for the feed, one card per app."""
+        if self.state.get("feed_ratings_seeded"):
+            return
+        try:
+            self._ensure_apps()
+        except requests.RequestException as e:
+            log(f"rating history apps: {e}", "WARN")
+            return
+        counts = self.state.get("rating_counts") or {}
+        avgs = self.state.get("rating_avgs") or {}
+        entries = []
+        for app in self._apps_cache["apps"]:
+            app_id = app["id"]
+            name = app["attributes"].get("name", "?")
+            territories = counts.get(app_id) or {}
+            total = sum(int(value or 0) for value in territories.values())
+            if total <= 0:
+                continue
+            weighted = sum(
+                float((avgs.get(app_id) or {}).get(country) or 0) * int(value or 0)
+                for country, value in territories.items()
+            )
+            average = weighted / total if total else 0.0
+            entries.append(self._feed_rating_history(
+                app_id, name, total, round(average, 2)))
+        if entries:
+            self._feed_emit(entries)
+        if not FEED_FILE.exists():
+            self._feed_write()
+        self.state["feed_ratings_seeded"] = True
+        save_state(self.state)
+        log(f"rating history: {len(entries)} apps")
 
     def _sweep_ratings(self):
         """Diff per-storefront userRatingCount against a high-water baseline
