@@ -52,6 +52,7 @@ CLI:
   --replay       walk every project's purchase + renewal history and send the
                  real revenue events as celebratory lines (one-off, ~10 min)
   --send TEXT    send one raw message and exit
+  --photo PATH   with --send: send the image at PATH with TEXT as its caption
 """
 
 import base64
@@ -70,6 +71,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -89,6 +91,7 @@ STATE_FILE = HOME / ".local/state/storebot/state.json"
 LOG_DIR = HOME / ".local/state/storebot"
 
 TG_MAX_LEN = 4000
+TG_CAPTION_MAX = 1024
 FALLBACK_GRACE_SECONDS = 1800
 SALES_SEEN_SECONDS = 90 * 24 * 3600
 SALES_SEEN_MAX = 5000
@@ -305,7 +308,13 @@ class StoreBot:
             return 2
         if "--send" in sys.argv:
             text = sys.argv[sys.argv.index("--send") + 1]
-            self.send(text)
+            photo = sys.argv[sys.argv.index("--photo") + 1] if "--photo" in sys.argv[:-1] else ""
+            if photo and os.path.isfile(photo):
+                self.send_photo(photo, self._caption(text))
+                if len(text) > TG_CAPTION_MAX:
+                    self.send(text)
+            else:
+                self.send(text)
             print("sent")
             return 0
         if not self.acquire_lock():
@@ -378,6 +387,56 @@ class StoreBot:
         for chunk in self._chunks(text):
             self.tg_api("sendMessage", {"chat_id": chat_id, "text": chunk,
                                         "disable_notification": silent}, retry=False)
+
+    def send_photo(self, path, caption, chat_id=None):
+        chat_id = chat_id or (self.chat_ids[0] if self.chat_ids else None)
+        if not chat_id:
+            raise RuntimeError("no chat id configured")
+        path = Path(path)
+        content_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        body, multipart_type = self._multipart_body(
+            {"chat_id": chat_id, "caption": caption},
+            "photo", path.name, content_type, path.read_bytes())
+        req = urllib.request.Request(f"{self.api_base}/bot{self.token}/sendPhoto", data=body,
+                                     headers={"Content-Type": multipart_type})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                data = json.loads(e.read())
+            except (ValueError, OSError):
+                data = None
+            if isinstance(data, dict) and not data.get("ok"):
+                raise RuntimeError(f"telegram sendPhoto: {data.get('description', 'unknown')}")
+            raise RuntimeError(f"telegram sendPhoto: http {e.code}")
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            raise RuntimeError(f"telegram sendPhoto: {e}")
+        if not data.get("ok"):
+            raise RuntimeError(f"telegram sendPhoto: {data.get('description', 'unknown')}")
+        return data.get("result")
+
+    @staticmethod
+    def _multipart_body(fields, file_field, filename, content_type, data):
+        boundary = uuid.uuid4().hex
+        parts = []
+        for name, value in fields.items():
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                         .encode() + str(value).encode() + b"\r\n")
+        safe_name = filename.replace('"', '\\"')
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+                     f'filename="{safe_name}"\r\nContent-Type: {content_type}\r\n\r\n'.encode()
+                     + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+    @staticmethod
+    def _caption(text):
+        if len(text) <= TG_CAPTION_MAX:
+            return text
+        head = text[:TG_CAPTION_MAX]
+        cut = max((i for i, ch in enumerate(head) if ch.isspace()), default=0)
+        return head[:cut].rstrip() or head
 
     def broadcast(self, text, silent=False):
         for chat_id in self.chat_ids:
