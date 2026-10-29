@@ -41,8 +41,7 @@ cancels one pending rating instead of arriving after it.
 **App Store sales without RevenueCat** (Master of Flags, Master of Inventory,
 PixiePocket, Tailscode): Apple's own App Store Server Notifications V2, posted
 to the same relay at `/asn?k=<STOREBOT_HOOK_SECRET>` and drained on the same
-30s tick, so they ping live like everything else. Set each app's **Production
-Server URL** to that address (App Store Connect → App Information → App Store
+300s tick (configurable), so they ping live like everything else. Set each app's **Production Server URL** to that address (App Store Connect → App Information → App Store
 Server Notifications, version 2) — there is no API for it. Product names come
 from the app's ASC in-app purchases, and once an app has delivered one
 notification the daily sweep stops reporting its sales a day later.

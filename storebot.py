@@ -38,7 +38,7 @@ plain KEY=value lines accepted):
   ~/.config/storebot/secrets.env   STOREBOT_TOKEN, STOREBOT_CHAT_IDS,
                                    STOREBOT_DIGEST_HOUR (default 9, App Store check hour),
                                    STOREBOT_POLL_SECONDS (default 60),
-                                   STOREBOT_HOOK_SECONDS (default 30),
+                                   STOREBOT_HOOK_SECONDS (default 300),
                                    STOREBOT_REVIEW_SECONDS (default 1800),
                                    STOREBOT_HOOK_URL (webhook relay worker),
                                    STOREBOT_HOOK_SECRET (relay + RC webhook auth),
@@ -233,9 +233,9 @@ def load_config():
     except ValueError:
         cfg["STOREBOT_POLL_SECONDS"] = 60
     try:
-        cfg["STOREBOT_HOOK_SECONDS"] = int(cfg.get("STOREBOT_HOOK_SECONDS", "30"))
+        cfg["STOREBOT_HOOK_SECONDS"] = int(cfg.get("STOREBOT_HOOK_SECONDS", "300"))
     except ValueError:
-        cfg["STOREBOT_HOOK_SECONDS"] = 30
+        cfg["STOREBOT_HOOK_SECONDS"] = 300
     try:
         cfg["STOREBOT_REVIEW_SECONDS"] = int(cfg.get("STOREBOT_REVIEW_SECONDS", "1800"))
     except ValueError:
