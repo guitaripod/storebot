@@ -821,7 +821,29 @@ class StoreBot:
             },
         }
 
-    def _feed_review(self, app_id, review_id, name, attrs, line, backfilled=False):
+    @staticmethod
+    def _answered(review):
+        """True when the developer has replied to a review in App Store
+        Connect (published or still pending)."""
+        return bool(((review.get("relationships") or {}).get("response") or {}).get("data"))
+
+    def _feed_mark_answered(self, reviews):
+        """Carries each listed review's reply state into its feed entry, so a
+        reader such as Libra stops asking for attention once it is answered."""
+        state = {f"review:{review.get('id')}": self._answered(review) for review in reviews}
+        changed = False
+        for entry in self._feed_entries:
+            answered = state.get(str(entry.get("id")))
+            review = entry.get("review")
+            if answered is None or not isinstance(review, dict):
+                continue
+            if bool(review.get("answered")) != answered:
+                review["answered"] = answered
+                changed = True
+        if changed:
+            self._feed_write()
+
+    def _feed_review(self, app_id, review_id, name, attrs, line, backfilled=False, answered=False):
         now = int(time.time() * 1000)
         return {
             "id": f"review:{review_id}",
@@ -841,6 +863,7 @@ class StoreBot:
                 "title": self._feed_one_line(attrs.get("title"), 200),
                 "body": self._feed_clean(attrs.get("body"), 2000),
                 "author": self._feed_one_line(attrs.get("reviewerNickname"), 80),
+                "answered": bool(answered),
             },
         }
 
@@ -1168,17 +1191,19 @@ class StoreBot:
             name = app["attributes"].get("name", "?")
             try:
                 data = self.asc_get(
-                    f"/v1/apps/{app_id}/customerReviews?limit=200&sort=-createdDate")
+                    f"/v1/apps/{app_id}/customerReviews?limit=200&sort=-createdDate&include=response")
             except requests.RequestException as e:
                 log(f"reviews {name}: {e}", "WARN")
                 continue
             reviews = data.get("data") or []
+            self._feed_mark_answered(reviews)
             if seed_needed or history_needed:
                 for rv in reviews:
                     attrs = rv.get("attributes") or {}
                     line = self._review_line(name, attrs)
                     seed_entries.append(self._feed_review(
-                        app_id, rv.get("id"), name, attrs, line, backfilled=True))
+                        app_id, rv.get("id"), name, attrs, line, backfilled=True,
+                        answered=self._answered(rv)))
                 seen.setdefault(app_id, [])
                 for rv in reviews:
                     rid = rv.get("id")
@@ -1217,7 +1242,7 @@ class StoreBot:
                 line = self._review_line(name, attrs)
                 pings.append(line)
                 feed_entries.append(self._feed_review(
-                    app_id, rv.get("id"), name, attrs, line))
+                    app_id, rv.get("id"), name, attrs, line, answered=self._answered(rv)))
         if seed_needed or history_needed:
             self._feed_emit(seed_entries)
             if not FEED_FILE.exists():
