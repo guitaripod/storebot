@@ -1,5 +1,5 @@
 [Unit]
-Description=storebot - Telegram App Store + RevenueCat sales reporting
+Description=storebot - Telegram App Store sales reporting
 After=network-online.target
 
 [Service]
