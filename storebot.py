@@ -16,6 +16,12 @@ Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
     when a project has no webhook or the relay is down) and suppresses itself
     around webhook deliveries so nothing double-pings.
 
+  - Midgar ledger sales: every App Store record sends its Server Notifications
+    to the Midgar ledger first, which queues each sale in the relay's shape.
+    Draining that queue on the same tick makes apps without RevenueCat in the
+    binary ping live too; a sale both paths see is collapsed by App Store
+    transaction id. The first drain acknowledges the backlog without pinging.
+
   - Everything else Apple-side (paid-app downloads, invisible to RevenueCat,
     plus one-time IAPs / subscriptions of apps with no RC project): checks
     the App Store SALES report once a day (default 09:00) and pings every
@@ -42,6 +48,9 @@ plain KEY=value lines accepted):
                                    STOREBOT_REVIEW_SECONDS (default 1800),
                                    STOREBOT_HOOK_URL (webhook relay worker),
                                    STOREBOT_HOOK_SECRET (relay + RC webhook auth),
+                                   STOREBOT_LEDGER_URL (Midgar ledger, e.g. https://api.midgarcorp.cc/v1/ledger),
+                                   STOREBOT_LEDGER_SECRET (the ledger's events secret),
+                                   STOREBOT_LEDGER_APP_ID (registry slug the gateway requires as X-App-ID),
                                    STOREBOT_VENDOR (ASC vendor number),
                                    STOREBOT_API_BASE (default https://api.telegram.org)
   ~/.config/midgar/credentials.env ASC_KEY_ID, ASC_ISSUER_ID,
@@ -95,6 +104,7 @@ TG_CAPTION_MAX = 1024
 FALLBACK_GRACE_SECONDS = 1800
 SALES_SEEN_SECONDS = 90 * 24 * 3600
 SALES_SEEN_MAX = 5000
+LEDGER_PAGE = 500
 FEED_FILE = LOG_DIR / "feed.json"
 FEED_ALIVE = LOG_DIR / "feed.alive"
 FEED_MAX = 500
@@ -280,6 +290,9 @@ class StoreBot:
         self.review_seconds = self.cfg["STOREBOT_REVIEW_SECONDS"]
         self.hook_url = self.cfg.get("STOREBOT_HOOK_URL", "").rstrip("/")
         self.hook_secret = self.cfg.get("STOREBOT_HOOK_SECRET", "")
+        self.ledger_url = self.cfg.get("STOREBOT_LEDGER_URL", "").rstrip("/")
+        self.ledger_secret = self.cfg.get("STOREBOT_LEDGER_SECRET", "")
+        self.ledger_app_id = self.cfg.get("STOREBOT_LEDGER_APP_ID", "")
         self.vendor = self.cfg.get("STOREBOT_VENDOR", "")
         self.state = load_state()
         if "digest_enabled" in self.state and "alerts_enabled" not in self.state:
@@ -744,11 +757,20 @@ class StoreBot:
 
     def _notifies_storebot(self, app):
         """True when an app's App Store Server Notification URL points at the
-        relay, which is what makes its purchases arrive live."""
-        target = f"{self.hook_url}/asn"
+        relay or at the drained Midgar ledger, which is what makes its
+        purchases arrive live."""
         attr = app.get("attributes") or {}
         url = attr.get("subscriptionStatusUrl") or ""
-        return bool(self.hook_url) and url.startswith(target)
+        targets = []
+        if self.hook_url:
+            targets.append(f"{self.hook_url}/asn")
+        if self._ledger_configured():
+            targets.append(f"{self.ledger_url}/notifications/")
+        return any(url.startswith(target) for target in targets)
+
+    def _ledger_configured(self):
+        """True when the Midgar ledger's sale queue can be drained."""
+        return bool(self.ledger_url and self.ledger_secret and self.ledger_app_id)
 
     def _is_live_covered(self, app_title):
         """True when an app's IAP rows already ping the moment they happen —
@@ -1219,7 +1241,12 @@ class StoreBot:
 
     @staticmethod
     def _sale_key(event, event_id):
+        """The dedup key of a sale: its App Store transaction id when known.
+        RevenueCat events name it `transaction_id`; events built from Apple's
+        notifications (relay and ledger) carry it as their own `id`."""
         txn = str(event.get("transaction_id") or "").strip()
+        if not txn and event.get("store") == "app_store":
+            txn = str(event.get("id") or "").strip()
         return f"txn:{txn}" if txn else f"event:{event_id}"
 
     def _claim_sale(self, key, now):
@@ -1282,25 +1309,49 @@ class StoreBot:
         flag = self._flag(event.get("country_code"))
         return f"{tag} {flag} {label}: {self._money(price, event.get('currency'))}".strip()
 
+    def _sale_queues(self):
+        """Every sale queue to drain, as (label, base URL, headers): the
+        storebot-hook relay, then the Midgar ledger. Both serve `GET /events`
+        and `POST /ack` in the same shape."""
+        queues = []
+        if self.hook_url:
+            queues.append(("hook", self.hook_url, {"X-Hook-Secret": self.hook_secret}))
+        if self._ledger_configured():
+            queues.append(("ledger", self.ledger_url, {"X-Hook-Secret": self.ledger_secret,
+                                                      "X-App-ID": self.ledger_app_id}))
+        return queues
+
     def _tick_hook(self):
-        """Drain the webhook relay queue and turn each sale into a ping."""
+        """Drain every sale queue and turn each sale into a ping."""
         now = time.time()
-        if now - self._last_hook < self.hook_seconds or not self.hook_url:
+        queues = self._sale_queues()
+        if now - self._last_hook < self.hook_seconds or not queues:
             return
         self._last_hook = now
         if not self._ever_sold_seeded:
             self._seed_ever_sold()
             self._ever_sold_seeded = True
+        for label, base, headers in queues:
+            self._drain_queue(label, base, headers, now)
+
+    def _drain_queue(self, label, base, headers, now):
+        """Ping the new sales in one queue and acknowledge everything it
+        returned. Until the ledger's backlog has been drained once, its sales
+        are only recorded and acknowledged, so weeks of queued purchases never
+        replay as fresh pings; a full page keeps seeding on the next tick."""
         try:
-            r = requests.get(f"{self.hook_url}/events", timeout=30,
-                             headers={"X-Hook-Secret": self.hook_secret})
+            r = requests.get(f"{base}/events", timeout=30, headers=headers)
             r.raise_for_status()
             events = (r.json() or {}).get("events") or []
         except requests.RequestException as e:
-            log(f"hook fetch: {e}", "WARN")
+            log(f"{label} fetch: {e}", "WARN")
             return
         if not events:
+            if label == "ledger" and not self.state.get("ledger_seeded"):
+                self.state["ledger_seeded"] = True
+                save_state(self.state)
             return
+        seeding = label == "ledger" and not self.state.get("ledger_seeded")
         processed = self.state.setdefault("seen_events", [])
         seen = set(processed)
         pings = []
@@ -1320,7 +1371,7 @@ class StoreBot:
                 project = next((p for p in self._projects_ok()
                                 if p["env"].replace("RC_SECRET_", "").lower() == slug), None)
             if project is None:
-                log(f"hook event for unknown project {project_name!r}", "WARN")
+                log(f"{label} event for unknown project {project_name!r}", "WARN")
                 continue
             try:
                 event = json.loads(entry.get("payload") or "{}")
@@ -1330,11 +1381,14 @@ class StoreBot:
             if not self._is_money_event(event):
                 continue
             key = self._sale_key(event, event_id)
+            if seeding:
+                self._claim_sale(key, now)
+                continue
             if not self._claim_sale(key, now):
-                log(f"hook duplicate sale {key} ({event_id}); skipping", "INFO")
+                log(f"{label} duplicate sale {key} ({event_id}); skipping", "INFO")
                 continue
             if fallback.get(project["name"], 0) + FALLBACK_GRACE_SECONDS > now:
-                log(f"hook sale {key} already covered by revenue fallback; skipping", "INFO")
+                log(f"{label} sale {key} already covered by revenue fallback; skipping", "INFO")
                 continue
             first_ever = not (self.state.get("ever_sold") or {}).get(project["name"])
             sale_day = datetime.fromtimestamp(
@@ -1351,6 +1405,10 @@ class StoreBot:
                     first_ever=first_ever, first_today=first_today,
                 ))
         self.state["seen_events"] = (processed + list(seen - set(processed)))[-1000:]
+        if seeding:
+            if len(events) < LEDGER_PAGE:
+                self.state["ledger_seeded"] = True
+            log(f"ledger seeding: {len(events)} queued events acknowledged without pings")
         if feed_entries:
             self._feed_emit(feed_entries)
         save_state(self.state)
@@ -1362,13 +1420,13 @@ class StoreBot:
         if pings and self.state.get("alerts_enabled", True):
             text = "\n".join(pings)
             self.broadcast(text)
-            log(f"hook pings: {'; '.join(pings)}")
+            log(f"{label} pings: {'; '.join(pings)}")
         try:
             ids = [e["id"] for e in events]
-            requests.post(f"{self.hook_url}/ack", timeout=30, json={"ids": ids},
-                          headers={"X-Hook-Secret": self.hook_secret})
+            r = requests.post(f"{base}/ack", timeout=30, json={"ids": ids}, headers=headers)
+            r.raise_for_status()
         except requests.RequestException as e:
-            log(f"hook ack: {e}", "WARN")
+            log(f"{label} ack: {e}", "WARN")
 
     # ----------------------------------------------------------------- reviews
 
@@ -2213,15 +2271,18 @@ class StoreBot:
             return f"{p['name']} proceeds {yesterday}: {self.rc_revenue(p, yesterday, yesterday)}"
         check("revenuecat revenue range", _rev)
 
-        def _hook():
-            if not self.hook_url:
+        def _queues():
+            queues = self._sale_queues()
+            if not queues:
                 return "not configured"
-            r = requests.get(f"{self.hook_url}/events", timeout=30,
-                             headers={"X-Hook-Secret": self.hook_secret})
-            r.raise_for_status()
-            n = len((r.json() or {}).get("events") or [])
-            return f"relay ok, {n} queued events"
-        check("webhook relay", _hook)
+            parts = []
+            for label, base, headers in queues:
+                r = requests.get(f"{base}/events", timeout=30, headers=headers)
+                r.raise_for_status()
+                n = len((r.json() or {}).get("events") or [])
+                parts.append(f"{label} ok, {n} queued events")
+            return "; ".join(parts)
+        check("sale queues", _queues)
 
         print("SELFTEST " + ("PASS" if ok else "FAIL"))
         return 0 if ok else 1

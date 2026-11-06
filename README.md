@@ -46,7 +46,16 @@ Server Notifications, version 2) — there is no API for it. Product names come
 from the app's ASC in-app purchases, and once an app has delivered one
 notification the daily sweep stops reporting its sales a day later.
 
-**No double pings**: RevenueCat and Apple notifications are collapsed by App
+**Midgar ledger sales** (every app, with or without RevenueCat in the binary):
+every App Store record sends its Server Notifications to the Midgar ledger
+first, which queues each sale in the relay's `GET /events` / `POST /ack`
+shape. storebot drains it on the same tick when `STOREBOT_LEDGER_URL`,
+`STOREBOT_LEDGER_SECRET` and `STOREBOT_LEDGER_APP_ID` are set, so apps that
+dropped the RevenueCat SDK still ping live. The first drain acknowledges the
+queued backlog without pinging, and an app whose notification URL points at
+the ledger counts as live, so the daily sweep stops repeating its sales.
+
+**No double pings**: RevenueCat, relay and ledger events are collapsed by App
 Store transaction id, the revenue fallback defers to proven webhooks, and
 ambiguous Telegram send timeouts are never retried. A second storebot process
 refuses to start.
@@ -79,7 +88,8 @@ systemctl --user enable --now storebot
 
 Config is read from `~/.config/storebot/secrets.env` (bot-specific:
 `STOREBOT_POLL_SECONDS`, `STOREBOT_HOOK_SECONDS`, `STOREBOT_REVIEW_SECONDS`,
-`STOREBOT_HOOK_URL`, `STOREBOT_HOOK_SECRET`, `STOREBOT_DIGEST_HOUR`,
+`STOREBOT_HOOK_URL`, `STOREBOT_HOOK_SECRET`, `STOREBOT_LEDGER_URL`,
+`STOREBOT_LEDGER_SECRET`, `STOREBOT_LEDGER_APP_ID`, `STOREBOT_DIGEST_HOUR`,
 `STOREBOT_VENDOR`) and `~/.config/midgar/credentials.env` (ASC + RevenueCat
 secrets; every `RC_SECRET_*` project is auto-discovered). Both files are
 parsed by the bot itself, so `export KEY=value`, quotes and inline comments
@@ -88,7 +98,7 @@ all work.
 ## Checks
 
 ```sh
-python3 storebot.py --selftest     # validate ASC + RC + relay data layer
+python3 storebot.py --selftest     # validate ASC + RC + relay + ledger data layer
 python3 storebot.py --replay       # one-off: send all real history events as pings
 python3 storebot.py --send "test"  # send one raw message
 ```
