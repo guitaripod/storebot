@@ -40,7 +40,9 @@ confirms it) so history never replays. Stars-only ratings now wait two review
 cycles plus five minutes; a written review that surfaces in that window
 cancels one pending rating instead of arriving after it.
 
-**No double pings**: sales are collapsed by App Store transaction id, an app
+**No double pings**: sales are collapsed by App Store transaction id, a review
+by its App Store Connect id and by its content (so a review Apple re-imports
+under a new id after an app transfer still pings once), an app
 the ledger reports live is skipped by the daily sweep, and ambiguous Telegram
 send timeouts are never retried. A second storebot process refuses to start.
 

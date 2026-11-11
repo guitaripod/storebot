@@ -57,6 +57,7 @@ import fcntl
 import gzip
 import hashlib
 import io
+import hashlib
 import json
 import os
 import re
@@ -87,6 +88,8 @@ TG_MAX_LEN = 4000
 TG_CAPTION_MAX = 1024
 SALES_SEEN_SECONDS = 90 * 24 * 3600
 SALES_SEEN_MAX = 5000
+REVIEW_FP_SECONDS = 2 * 365 * 24 * 3600
+REVIEW_FP_MAX = 20000
 LEDGER_PAGE = 500
 FEED_FILE = LOG_DIR / "feed.json"
 FEED_ALIVE = LOG_DIR / "feed.alive"
@@ -1159,6 +1162,53 @@ class StoreBot:
             return f"{stars} {name} — “{text}” — {nick} {flag}".strip()
         return f"{stars} {name} — {nick} {flag}".strip()
 
+    @staticmethod
+    def _unique_reviews(reviews):
+        """One row per review id, so a page that lists a review twice pings once."""
+        unique = {}
+        for review in reviews:
+            if review.get("id"):
+                unique[review["id"]] = review
+        return list(unique.values())
+
+    @staticmethod
+    def _review_fingerprint(app_id, attrs):
+        """A review's content identity: whatever id Apple re-imports it under
+        (an app transfer, a storefront merge), the same words from the same
+        reviewer at the same moment are one review."""
+        parts = [
+            str(app_id),
+            attrs.get("reviewerNickname") or "",
+            attrs.get("title") or "",
+            attrs.get("body") or "",
+            str(attrs.get("createdDate") or ""),
+        ]
+        return hashlib.sha1("\x00".join(parts).encode("utf-8")).hexdigest()
+
+    def _claim_review(self, seen, fingerprints, app_id, review, now):
+        """True for a review never pinged before, false for a repeat, claiming
+        its id and its content so neither a re-listed page nor a re-imported
+        review can ping twice."""
+        rid = review.get("id")
+        if not rid:
+            return False
+        attrs = review.get("attributes") or {}
+        fingerprint = self._review_fingerprint(app_id, attrs)
+        known = seen.setdefault(app_id, [])
+        if rid in known or fingerprint in fingerprints:
+            return False
+        seen[app_id] = (known + [rid])[-200:]
+        fingerprints[fingerprint] = now
+        cutoff = now - REVIEW_FP_SECONDS
+        for old, stamp in list(fingerprints.items()):
+            if stamp < cutoff:
+                fingerprints.pop(old, None)
+        if len(fingerprints) > REVIEW_FP_MAX:
+            excess = len(fingerprints) - REVIEW_FP_MAX
+            for old, _ in sorted(fingerprints.items(), key=lambda item: item[1])[:excess]:
+                fingerprints.pop(old, None)
+        return True
+
     def _tick_reviews(self):
         """Poll App Store Connect customerReviews and ping every new written
         review at any star level, then sweep storefront rating counts so
@@ -1180,6 +1230,7 @@ class StoreBot:
             return
         seen = self.state.setdefault("reviews_seen", {})
         pending = self.state.setdefault("review_pending", {})
+        fingerprints = self.state.setdefault("review_fingerprints", {})
         pings = []
         feed_entries = []
         seed_entries = []
@@ -1195,8 +1246,9 @@ class StoreBot:
             except requests.RequestException as e:
                 log(f"reviews {name}: {e}", "WARN")
                 continue
-            reviews = data.get("data") or []
+            reviews = self._unique_reviews(data.get("data") or [])
             self._feed_mark_answered(reviews)
+            first_poll = app_id not in seen
             if seed_needed or history_needed:
                 for rv in reviews:
                     attrs = rv.get("attributes") or {}
@@ -1204,26 +1256,29 @@ class StoreBot:
                     seed_entries.append(self._feed_review(
                         app_id, rv.get("id"), name, attrs, line, backfilled=True,
                         answered=self._answered(rv)))
-                seen.setdefault(app_id, [])
-                for rv in reviews:
-                    rid = rv.get("id")
-                    if rid and rid not in seen[app_id]:
-                        seen[app_id].append(rid)
-                seen[app_id] = seen[app_id][-200:]
                 dirty = True
-            known = set(seen.get(app_id) or [])
-            fresh = [rv for rv in reviews if rv["id"] not in known]
-            if app_id not in seen:
-                seen[app_id] = [rv["id"] for rv in reviews][-200:]
+            if first_poll:
+                for rv in reviews:
+                    self._claim_review(seen, fingerprints, app_id, rv, now)
                 dirty = True
                 continue
+            known = set(seen.get(app_id) or [])
+            for rv in reviews:
+                if rv.get("id") not in known:
+                    continue
+                fingerprint = self._review_fingerprint(app_id, rv.get("attributes") or {})
+                if fingerprint not in fingerprints:
+                    fingerprints[fingerprint] = now
+                    dirty = True
+            fresh = [rv for rv in reviews if rv.get("id") not in known]
             if not fresh:
                 continue
-            seen[app_id] = (seen[app_id] + [rv["id"] for rv in fresh])[-200:]
             dirty = True
             pend = pending.setdefault(app_id, {})
             holds = self.state.setdefault("rating_holds", {})
             for rv in fresh:
+                if not self._claim_review(seen, fingerprints, app_id, rv, now):
+                    continue
                 attrs = rv["attributes"]
                 terr = (attrs.get("territory") or "").upper()
                 rating = attrs.get("rating") or 1
