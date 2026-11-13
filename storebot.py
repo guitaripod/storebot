@@ -108,6 +108,8 @@ CURRENCY_SYMBOLS = {
 
 MONEY_EVENT_TYPES = {"INITIAL_PURCHASE", "RENEWAL", "NON_RENEWING_PURCHASE"}
 
+RATING_COUNTRIES = 25
+
 TERRITORY_ALPHA2 = {
     "AFG": "af", "AGO": "ao", "AIA": "ai", "ALB": "al", "ARE": "ae",
     "ARG": "ar", "ARM": "am", "ATG": "ag", "AUS": "au", "AUT": "at",
@@ -726,6 +728,7 @@ class StoreBot:
             "version": FEED_VERSION,
             "written_at": int(time.time() * 1000),
             "entries": self._feed_entries[:FEED_MAX],
+            "ratings": self._ratings_summary(),
         }
         try:
             FEED_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -733,8 +736,39 @@ class StoreBot:
             tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
             os.chmod(tmp, 0o600)
             tmp.replace(FEED_FILE)
+            self._feed_ratings_written = True
         except OSError as e:
             log(f"feed write: {e}", "ERROR")
+
+    def _ratings_summary(self):
+        """Every app's App Store star rating as the public lookup last read it,
+        keyed by App Store id: the ratings of every storefront together, their
+        weighted average and the storefronts with ratings, most first (at most
+        RATING_COUNTRIES), for the app pages of Libra."""
+        counts = self.state.get("rating_counts") or {}
+        avgs = self.state.get("rating_avgs") or {}
+        summary = {}
+        for app_id, territories in counts.items():
+            rows = []
+            for country, n in (territories or {}).items():
+                n = int(n or 0)
+                if n <= 0:
+                    continue
+                avg = float((avgs.get(app_id) or {}).get(country) or 0)
+                rows.append((self._feed_country(country), n, avg))
+            total = sum(n for _, n, _ in rows)
+            if total <= 0:
+                continue
+            rows.sort(key=lambda row: (-row[1], row[0]))
+            summary[str(app_id)] = {
+                "count": total,
+                "average": round(sum(n * avg for _, n, avg in rows) / total, 2),
+                "countries": [
+                    {"country": country, "count": n, "average": round(avg, 2)}
+                    for country, n, avg in rows[:RATING_COUNTRIES]
+                ],
+            }
+        return summary
 
     def _feed_alive_write(self):
         try:
@@ -1540,6 +1574,8 @@ class StoreBot:
                 holds.pop(app_id, None)
         if feed_entries:
             self._feed_emit(feed_entries)
+        elif dirty or not getattr(self, "_feed_ratings_written", False):
+            self._feed_write()
         if dirty:
             save_state(self.state)
         if pings and self.state.get("alerts_enabled", True):
