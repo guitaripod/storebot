@@ -1,5 +1,5 @@
 [Unit]
-Description=storebot - Telegram App Store sales reporting
+Description=storebot - App Store sales, reviews and ratings collector for Libra
 After=network-online.target
 
 [Service]

@@ -247,8 +247,8 @@ class StoreBot:
         self.ledger_app_id = self.cfg.get("STOREBOT_LEDGER_APP_ID", "")
         self.vendor = self.cfg.get("STOREBOT_VENDOR", "")
         self.state = load_state()
-        if "digest_enabled" in self.state and "alerts_enabled" not in self.state:
-            self.state["alerts_enabled"] = self.state.pop("digest_enabled")
+        self.state.pop("digest_enabled", None)
+        self.state.pop("alerts_enabled", None)
         self.started = time.time()
         self._jwt = ""
         self._jwt_exp = 0.0
@@ -397,13 +397,6 @@ class StoreBot:
         cut = max((i for i, ch in enumerate(head) if ch.isspace()), default=0)
         return head[:cut].rstrip() or head
 
-    def broadcast(self, text, silent=False):
-        for chat_id in self.chat_ids:
-            try:
-                self.send(text, silent=silent, chat_id=chat_id)
-            except RuntimeError as e:
-                log(f"telegram {chat_id}: {e}", "ERROR")
-
     @staticmethod
     def _chunks(text):
         if len(text) <= TG_MAX_LEN:
@@ -548,9 +541,8 @@ class StoreBot:
 
     def _status_text(self):
         up = time.time() - self.started
-        enabled = self.state.get("alerts_enabled", True)
         return "\n".join([
-            f"🟢 storebot up {int(up // 3600)}h{int(up % 3600 // 60):02d}m · alerts {'ON' if enabled else 'OFF'}",
+            f"🟢 storebot up {int(up // 3600)}h{int(up % 3600 // 60):02d}m · collecting for Libra",
             f"Ledger sales every {self.sales_seconds}s · reviews {self.review_seconds}s · App Store check daily {self.digest_hour:02d}:00",
             f"Ledger: {'connected' if self._ledger_configured() else 'NOT CONFIGURED'} · apps proven live: {len(self.state.get('asn_apps', {}))}",
         ])
@@ -729,6 +721,7 @@ class StoreBot:
             "written_at": int(time.time() * 1000),
             "entries": self._feed_entries[:FEED_MAX],
             "ratings": self._ratings_summary(),
+            "unwired": list(self.state.get("coverage_unwired") or []),
         }
         try:
             FEED_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1100,10 +1093,11 @@ class StoreBot:
         return {"X-Hook-Secret": self.ledger_secret, "X-App-ID": self.ledger_app_id}
 
     def _tick_sales(self):
-        """Ping the new sales in the ledger's queue and acknowledge everything
-        it returned. Until the backlog has been drained once, its sales are only
-        recorded and acknowledged, so weeks of queued purchases never replay as
-        fresh pings; a full page keeps seeding on the next tick."""
+        """Write the new sales in the ledger's queue into the feed and
+        acknowledge everything it returned. Until the backlog has been drained
+        once, its sales are only recorded and acknowledged, so weeks of queued
+        purchases never replay as fresh sales; a full page keeps seeding on the
+        next tick."""
         now = time.time()
         if now - self._last_sales < self.sales_seconds or not self._ledger_configured():
             return
@@ -1170,10 +1164,8 @@ class StoreBot:
         if feed_entries:
             self._feed_emit(feed_entries)
         save_state(self.state)
-        if pings and self.state.get("alerts_enabled", True):
-            text = "\n".join(pings)
-            self.broadcast(text)
-            log(f"ledger pings: {'; '.join(pings)}")
+        if pings:
+            log(f"ledger sales: {'; '.join(pings)}")
         try:
             ids = [e["id"] for e in events]
             r = requests.post(f"{self.ledger_url}/ack", timeout=30, json={"ids": ids},
@@ -1343,9 +1335,8 @@ class StoreBot:
             self._feed_emit(feed_entries)
         if dirty:
             save_state(self.state)
-        if pings and self.state.get("alerts_enabled", True):
-            self.broadcast("\n".join(pings))
-            log(f"review pings: {len(pings)}")
+        if pings:
+            log(f"new reviews: {len(pings)}")
         self._sweep_ratings()
         self._seed_rating_history()
 
@@ -1578,9 +1569,8 @@ class StoreBot:
             self._feed_write()
         if dirty:
             save_state(self.state)
-        if pings and self.state.get("alerts_enabled", True):
-            self.broadcast("\n".join(pings))
-            log(f"rating pings: {len(pings)}")
+        if pings:
+            log(f"new ratings: {len(pings)}")
 
     # ------------------------------------------------------------------ loop
 
@@ -1617,25 +1607,22 @@ class StoreBot:
                 "(App Store notifications do not reach the ledger): " + ", ".join(unwired))
 
     def _tick_coverage(self):
-        """Every 6h, ping when an app that can take money is not wired to the
-        live path. Only a change in the gap set re-pings."""
+        """Every 6h, list the apps that can take money but are not wired to the
+        live path and write a changed list into the feed, where Libra shows it
+        as something that needs the founder."""
         now = time.time()
         if now - self._last_coverage < 21600:
             return
         self._last_coverage = now
-        if not self.state.get("alerts_enabled", True):
-            return
         unwired = self._coverage_gaps()
         signature = json.dumps(unwired, sort_keys=True)
-        if signature == self.state.get("coverage_sig"):
+        if signature == self.state.get("coverage_sig") and "coverage_unwired" in self.state:
             return
         self.state["coverage_sig"] = signature
+        self.state["coverage_unwired"] = unwired
         save_state(self.state)
-        if not unwired:
-            return
-        text = self._coverage_text(unwired)
-        self.broadcast(text)
-        log(f"coverage gaps: {text}")
+        self._feed_write()
+        log(f"coverage: {self._coverage_text(unwired)}")
 
     def run_forever(self):
         try:
@@ -1770,10 +1757,8 @@ class StoreBot:
             self._feed_emit(feed_entries)
         self.state["last_as_check"] = today
         save_state(self.state)
-        if pings and self.state.get("alerts_enabled", True):
-            text = "\n".join(pings)
-            self.broadcast(text)
-            log(f"appstore ping: {'; '.join(pings)}")
+        if pings:
+            log(f"appstore sales: {'; '.join(pings)}")
 
     def _drain_backlog(self):
         try:
@@ -1793,14 +1778,6 @@ class StoreBot:
             self.send(self._status_text())
         elif cmd == "/coverage":
             self.send(self._coverage_text(self._coverage_gaps()))
-        elif cmd == "/on":
-            self.state["alerts_enabled"] = True
-            save_state(self.state)
-            self.send("Alerts ON.")
-        elif cmd == "/off":
-            self.state["alerts_enabled"] = False
-            save_state(self.state)
-            self.send("Alerts OFF. /on to re-enable.")
         elif cmd.startswith("/"):
             self.send("Unknown command. /help")
         else:
@@ -1846,9 +1823,7 @@ class StoreBot:
 
 COMMANDS = [
     ("status", "bot health"),
-    ("coverage", "apps not wired to live sale pings"),
-    ("on", "enable alerts"),
-    ("off", "disable alerts"),
+    ("coverage", "apps whose sales reach the ledger a day late"),
     ("help", "list commands"),
 ]
 
