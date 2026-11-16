@@ -30,7 +30,13 @@ Long-polls a dedicated Telegram bot. One job: pings the chat when money lands.
     count delta, so nothing double-pings. The lookup's count wobbles, so the
     diff runs against a high-water baseline and lower reads are absorbed.
 
-Refunds are tracked silently. Control commands: /status, /coverage, /on, /off, /help.
+Refunds are tracked silently. Control commands: /status, /coverage, /help.
+
+Other programs send through this bot's token and may put inline buttons under
+their messages. Telegram lets one process poll a bot, so storebot receives the
+taps and hands each to the program named before the first colon of the
+button's data: "rounds:..." runs `rounds callback` with the callback query as
+JSON on stdin, and that program answers the tap itself.
 
 Config (both files parsed by the bot itself; sourceable `export KEY=value` and
 plain KEY=value lines accepted):
@@ -62,6 +68,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -1647,7 +1654,7 @@ class StoreBot:
             try:
                 updates = self.tg_api("getUpdates", {
                     "offset": self.state.get("update_offset", 0), "timeout": 25,
-                    "allowed_updates": ["message"]}, timeout=40)
+                    "allowed_updates": ["message", "callback_query"]}, timeout=40)
             except RuntimeError as e:
                 log(f"getUpdates: {e}", "WARN")
                 time.sleep(5)
@@ -1655,6 +1662,12 @@ class StoreBot:
             for u in updates or []:
                 self.state["update_offset"] = u["update_id"] + 1
                 save_state(self.state)
+                if u.get("callback_query"):
+                    try:
+                        self._forward_callback(u["callback_query"])
+                    except Exception as e:
+                        log(f"callback forwarding: {e}", "ERROR")
+                    continue
                 msg = u.get("message") or {}
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
                 text = (msg.get("text") or "").strip()
@@ -1668,6 +1681,35 @@ class StoreBot:
                         self.send(f"⚠️ error handling that: {e}")
                     except RuntimeError:
                         pass
+
+    def _forward_callback(self, query):
+        """Hand a tapped inline button to the program named before the first
+        colon of its data, with the callback query as JSON on stdin. The
+        program answers the tap with this bot's token. A tap from another
+        chat, for an unknown program, or one the program fails on is answered
+        here, so the button stops loading and says why."""
+        chat_id = str(((query.get("message") or {}).get("chat") or {}).get("id", ""))
+        program = CALLBACK_PROGRAMS.get((query.get("data") or "").partition(":")[0])
+        problem = None
+        if chat_id not in self.chat_ids or not program:
+            problem = "Nothing here handles this button."
+        else:
+            try:
+                done = subprocess.run([program, "callback"], input=json.dumps(query), text=True,
+                                      capture_output=True, timeout=CALLBACK_TIMEOUT)
+                if done.returncode != 0:
+                    problem = f"{program} could not take that."
+                    log(f"{program} callback: exit {done.returncode}: {done.stderr.strip()[-300:]}", "ERROR")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                problem = f"{program} could not take that."
+                log(f"{program} callback: {e}", "ERROR")
+        if not problem:
+            return
+        try:
+            self.tg_api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": problem,
+                                                "show_alert": True}, retry=False)
+        except RuntimeError as e:
+            log(f"answerCallbackQuery: {e}", "WARN")
 
     def _backfill_appstore_feed(self):
         """Seed recent App Store sales into the feed once, without Telegram."""
@@ -1820,6 +1862,9 @@ class StoreBot:
         print("SELFTEST " + ("PASS" if ok else "FAIL"))
         return 0 if ok else 1
 
+
+CALLBACK_PROGRAMS = {"rounds": "rounds"}
+CALLBACK_TIMEOUT = 90
 
 COMMANDS = [
     ("status", "bot health"),

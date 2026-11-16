@@ -51,6 +51,13 @@ under a new id after an app transfer is still written once), an app
 the ledger reports live is skipped by the daily sweep. A second storebot
 process refuses to start.
 
+**Buttons**: other programs send through this bot's token and may put inline
+buttons under their messages. Telegram lets one process poll a bot, so
+storebot receives the taps and hands each one to the program named before the
+first colon of the button's data: `rounds:...` runs `rounds callback` with the
+callback query as JSON on stdin, and that program answers the tap itself. A
+tap nothing handles is answered with a notice.
+
 **Coverage audit**: every 6h storebot lists the App Store apps that can take
 money (any IAP or subscription group) but whose notifications do not reach the
 ledger, and writes the list into the feed as `unwired`; Libra shows each app on
